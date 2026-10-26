@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -1311,7 +1312,8 @@ var frontendAssetExts = map[string]bool{
 // route of the app's own ("/licenses/1.0", say) has an extension too,
 // so the list is explicit rather than "anything with a dot".
 func isFrontendAsset(clean string) bool {
-	return strings.HasPrefix(clean, "/assets/") || frontendAssetExts[strings.ToLower(filepath.Ext(clean))]
+	// clean is a URL path (forward slashes); use path.Ext, not filepath.Ext.
+	return strings.HasPrefix(clean, "/assets/") || frontendAssetExts[strings.ToLower(path.Ext(clean))]
 }
 
 // newLogger builds the application logger and makes it the one that
@@ -1353,19 +1355,22 @@ func serveFrontend(r *gin.Engine) {
 	}
 
 	r.Use(func(c *gin.Context) {
-		path := c.Request.URL.Path
+		reqPath := c.Request.URL.Path
 
 		// Let backend routes pass through.
-		if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/pay/") || path == "/health" || path == "/metrics" || path == "/docs" || strings.HasPrefix(path, "/docs/") {
+		if strings.HasPrefix(reqPath, "/api/") || strings.HasPrefix(reqPath, "/pay/") || reqPath == "/health" || reqPath == "/metrics" || reqPath == "/docs" || strings.HasPrefix(reqPath, "/docs/") {
 			c.Next()
 			return
 		}
 
-		// Try to serve a static file using path.Clean to prevent traversal.
+		// Clean with path (URL) rules, not filepath. HTTP paths always use
+		// '/', and filepath.Clean on Windows turns "/assets/…" into
+		// `\assets\…`, which breaks the "/assets/" prefix check used for
+		// immutable Cache-Control on hashed builds.
 		// Uses c.File() instead of c.FileFromFS() to avoid http.FileServer's
 		// implicit 301 redirects (e.g. /index.html → /).
-		if clean := filepath.Clean(path); clean != "/" && clean != "/index.html" {
-			filePath := filepath.Join(distPath, clean)
+		if clean := path.Clean(reqPath); clean != "/" && clean != "/index.html" {
+			filePath := filepath.Join(distPath, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
 			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
 				if strings.HasPrefix(clean, "/assets/") {
 					// Every name under /assets carries a content hash,
