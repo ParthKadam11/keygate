@@ -75,6 +75,22 @@ func TestServeFrontend(t *testing.T) {
 	if w := get("/favicon.ico"); w.Code != http.StatusNotFound {
 		t.Fatalf("missing file: %d, want 404", w.Code)
 	}
+	// Nothing outside dist is looked up, however the path is spelled. A
+	// backslash (%5C) survives path.Clean, and on Windows Join would read
+	// it as a separator: the file next to dist would be found, and
+	// ServeFile's refusal (400) would tell the caller it exists. Each of
+	// these is a route (the shell) or a missing asset (404), never more.
+	if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/../secret.txt", "/..%5Csecret.txt", "/..%5C..%5Csecret.txt",
+		"/assets/..%5C..%5C..%5Csecret.txt", "/%2E%2E%5C%2E%2E%5Csecret.txt"} {
+		w := get(p)
+		shell := w.Code == http.StatusOK && w.Header().Get("Content-Type") == "text/html; charset=utf-8"
+		if w.Body.String() == "secret" || (!shell && w.Code != http.StatusNotFound) {
+			t.Fatalf("%s: %d %q, want the shell or 404", p, w.Code, w.Header().Get("Content-Type"))
+		}
+	}
 	// API routes are never touched by the fallback.
 	if w := get("/api/v1/health"); w.Code != http.StatusOK || w.Body.String() != "api" {
 		t.Fatalf("api passthrough: %d %q", w.Code, w.Body.String())

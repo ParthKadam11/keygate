@@ -1370,16 +1370,24 @@ func serveFrontend(r *gin.Engine) {
 		// Uses c.File() instead of c.FileFromFS() to avoid http.FileServer's
 		// implicit 301 redirects (e.g. /index.html → /).
 		if clean := path.Clean(reqPath); clean != "/" && clean != "/index.html" {
-			filePath := filepath.Join(distPath, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
-			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
-				if strings.HasPrefix(clean, "/assets/") {
-					// Every name under /assets carries a content hash,
-					// so one URL never changes what it holds.
-					c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			// path.Clean leaves a backslash alone (%5C in the URL), and on
+			// Windows Join would take it as a separator and look outside
+			// dist: ServeFile refuses the file, but the answer still says
+			// it exists. Localize refuses a backslash, a drive letter and
+			// a device name (NUL, COM1) rather than turn them into a path,
+			// as http.Dir does.
+			if rel, err := filepath.Localize(strings.TrimPrefix(clean, "/")); err == nil {
+				filePath := filepath.Join(distPath, rel)
+				if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+					if strings.HasPrefix(clean, "/assets/") {
+						// Every name under /assets carries a content hash,
+						// so one URL never changes what it holds.
+						c.Header("Cache-Control", "public, max-age=31536000, immutable")
+					}
+					c.File(filePath)
+					c.Abort()
+					return
 				}
-				c.File(filePath)
-				c.Abort()
-				return
 			}
 			// A file that is missing is a 404, not the app shell. A tab
 			// still holding an older index.html asks for the asset that
