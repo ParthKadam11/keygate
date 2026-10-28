@@ -1032,7 +1032,13 @@ func (s *ReleaseService) FeedCutoff(ctx context.Context, licenseKey, productID s
 // cutoff comes from the license row, never from the token: a token
 // signed before a renewal, a revocation or a plan change must not
 // decide what the feed shows.
-func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID string) (*time.Time, error) {
+//
+// identifier is the device id from the token (did). When that device
+// was activated with a member key, a paused seat must refuse the feed
+// the same way FeedCutoff refuses the member's key via KeySeatPaused —
+// otherwise a JWT issued while the seat was active keeps unlocking
+// updates after the seat is paused.
+func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID, identifier string) (*time.Time, error) {
 	lic, err := s.store.FindLicenseByID(ctx, licenseID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1045,7 +1051,36 @@ func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, prod
 		!IsLicenseUsable(lic) {
 		return nil, licenseNotFound()
 	}
+	if err := s.refusePausedMemberToken(ctx, licenseID, identifier); err != nil {
+		return nil, err
+	}
 	return lic.EffectiveUpdatesUntil(), nil
+}
+
+// refusePausedMemberToken collapses a paused member's still-valid
+// license token into LICENSE_NOT_FOUND, matching FeedCutoff's key path.
+func (s *ReleaseService) refusePausedMemberToken(ctx context.Context, licenseID, identifier string) error {
+	if identifier == "" {
+		return nil
+	}
+	act, err := s.store.FindActivation(ctx, licenseID, identifier)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return apperr.Internal(err)
+	}
+	if act.SeatID == "" {
+		return nil
+	}
+	paused, err := s.store.SeatPaused(ctx, act.SeatID)
+	if err != nil {
+		return apperr.Internal(err)
+	}
+	if paused {
+		return licenseNotFound()
+	}
+	return nil
 }
 
 // ─── Helpers ───
