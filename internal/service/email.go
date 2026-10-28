@@ -946,14 +946,18 @@ func (s *EmailService) SendWelcome(to, name string) {
 	if s.skipDisabled("welcome", to) {
 		return
 	}
-	body := `<!DOCTYPE html>
-<html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-<h2>Welcome to Keygate!</h2>
-<p>Hi ` + name + `, your account has been created.</p>
-<p>You can manage your licenses and subscriptions from your portal.</p>
-</body></html>`
+	// Self-hosted installs set site_name; stock Keygate keeps the
+	// project name so an empty setting still greets as Keygate.
+	data := s.templateData(map[string]any{"Name": name})
+	site, _ := data["SiteName"].(string)
+	if strings.TrimSpace(site) == "" {
+		site = branding.Project
+		data["SiteName"] = site
+	}
+	body := s.renderEmail("welcome", tmplWelcome, data)
+	subject := "Welcome to " + site
 	go func() {
-		if err := s.Send(to, "Welcome to Keygate", body); err != nil {
+		if err := s.Send(to, subject, body); err != nil {
 			s.logger.Error("email delivery failed", "to", to, "error", err)
 		}
 	}()
@@ -1187,6 +1191,13 @@ func renderTemplate(tmplStr string, data any) string {
 	}
 	return buf.String()
 }
+
+const tmplWelcome = `<!DOCTYPE html>
+<html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+<h2>Welcome to {{.SiteName}}!</h2>
+<p>Hi {{.Name}}, your account has been created.</p>
+<p>You can manage your licenses and subscriptions from your portal.</p>
+</body></html>`
 
 const tmplLicenseCreated = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
