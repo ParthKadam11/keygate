@@ -31,8 +31,8 @@ export default function CheckoutSuccessPage() {
         setKind(r.kind ?? "")
       })
       .catch((e) => {
-        // Payment confirmed; delivery will retry. Same "processing" UI
-        // as status pending — not a hard failure (FULFILLMENT_RETRY).
+        // Paid, and the delivery that failed is retried (FULFILLMENT_RETRY):
+        // the same "processing" answer as a pending one, not a failure.
         setStatus(errorCode(e) === "FULFILLMENT_RETRY" ? "pending" : "error")
       })
   }, [])
