@@ -1033,11 +1033,12 @@ func (s *ReleaseService) FeedCutoff(ctx context.Context, licenseKey, productID s
 // signed before a renewal, a revocation or a plan change must not
 // decide what the feed shows.
 //
-// identifier is the device id from the token (did). When that device
-// was activated with a member key, a paused seat must refuse the feed
-// the same way FeedCutoff refuses the member's key via KeySeatPaused —
-// otherwise a JWT issued while the seat was active keeps unlocking
-// updates after the seat is paused.
+// identifier is the device id from the token (did). The device must
+// still be activated, as Verify requires, and a member's device must
+// not be on a paused seat, as FeedCutoff refuses the member's key via
+// KeySeatPaused: otherwise a token issued before the device was
+// released, the member removed or the seat paused keeps unlocking
+// updates until it expires.
 func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID, identifier string) (*time.Time, error) {
 	lic, err := s.store.FindLicenseByID(ctx, licenseID)
 	if err != nil {
@@ -1051,22 +1052,21 @@ func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, prod
 		!IsLicenseUsable(lic) {
 		return nil, licenseNotFound()
 	}
-	if err := s.refusePausedMemberToken(ctx, licenseID, identifier); err != nil {
+	if err := s.refuseTokenDevice(ctx, licenseID, identifier); err != nil {
 		return nil, err
 	}
 	return lic.EffectiveUpdatesUntil(), nil
 }
 
-// refusePausedMemberToken collapses a paused member's still-valid
-// license token into LICENSE_NOT_FOUND, matching FeedCutoff's key path.
-func (s *ReleaseService) refusePausedMemberToken(ctx context.Context, licenseID, identifier string) error {
-	if identifier == "" {
-		return nil
-	}
+// refuseTokenDevice collapses a still-valid license token into
+// LICENSE_NOT_FOUND when its device is no longer activated or is on a
+// paused member seat, matching what Verify and FeedCutoff's key path
+// answer for that device.
+func (s *ReleaseService) refuseTokenDevice(ctx context.Context, licenseID, identifier string) error {
 	act, err := s.store.FindActivation(ctx, licenseID, identifier)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+			return licenseNotFound()
 		}
 		return apperr.Internal(err)
 	}

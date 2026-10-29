@@ -222,7 +222,8 @@ func TestFeedCutoff_MaintenancePeriod(t *testing.T) {
 
 // A paused member's key is refused by FeedCutoff; a JWT they got while
 // active must not keep unlocking FeedCutoffForToken after the seat is
-// paused (same LICENSE_NOT_FOUND collapse).
+// paused, nor after the device is released or the member removed (same
+// LICENSE_NOT_FOUND collapse).
 func TestFeedCutoffForToken_PausedMemberSeat(t *testing.T) {
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
@@ -325,7 +326,31 @@ func TestFeedCutoffForToken_PausedMemberSeat(t *testing.T) {
 	if _, err := svc.FeedCutoff(ctx, keys[0], prod.ID); err != nil {
 		t.Fatalf("active member key feed: %v", err)
 	}
-	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, ""); err != nil {
-		t.Fatalf("token without device (owner-shaped) still resolves license: %v", err)
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "never-activated"); !notFound(err) {
+		t.Fatalf("token for a device not activated = %v, want LICENSE_NOT_FOUND", err)
+	}
+
+	// The owner's own device, then released.
+	if err := s.ActivateForKey(ctx, &model.Activation{
+		LicenseID: lic.ID, Identifier: "owner-pc", IdentifierType: "device",
+	}, 10, lic.LicenseKey); err != nil {
+		t.Fatalf("activate owner-pc: %v", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "owner-pc"); err != nil {
+		t.Fatalf("owner device token feed: %v", err)
+	}
+	if _, err := s.DB.NewRaw("DELETE FROM activations WHERE license_id = ? AND identifier = ?", lic.ID, "owner-pc").Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "owner-pc"); !notFound(err) {
+		t.Fatalf("released device token feed = %v, want LICENSE_NOT_FOUND", err)
+	}
+
+	// A removed member's devices go with them.
+	if _, _, err := s.RemoveSeat(ctx, seats[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "a-pc"); !notFound(err) {
+		t.Fatalf("removed member token feed = %v, want LICENSE_NOT_FOUND", err)
 	}
 }
