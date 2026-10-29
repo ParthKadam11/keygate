@@ -252,7 +252,7 @@ func (h *ReleasePublicHandler) parseFeedRequest(c *gin.Context) (req feedRequest
 			response.NotFound(c, "license not found")
 			return
 		}
-		cutoff, err := h.svc.FeedCutoffForToken(c.Request.Context(), claims.LicenseID, prod.ID)
+		cutoff, err := h.svc.FeedCutoffForToken(c.Request.Context(), claims.LicenseID, prod.ID, claims.Identifier)
 		if err != nil {
 			writeAppErr(c, err)
 			return

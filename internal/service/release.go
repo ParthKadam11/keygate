@@ -1032,7 +1032,14 @@ func (s *ReleaseService) FeedCutoff(ctx context.Context, licenseKey, productID s
 // cutoff comes from the license row, never from the token: a token
 // signed before a renewal, a revocation or a plan change must not
 // decide what the feed shows.
-func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID string) (*time.Time, error) {
+//
+// identifier is the device id from the token (did). The device must
+// still be activated, as Verify requires, and a member's device must
+// not be on a paused seat, as FeedCutoff refuses the member's key via
+// KeySeatPaused: otherwise a token issued before the device was
+// released, the member removed or the seat paused keeps unlocking
+// updates until it expires.
+func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, productID, identifier string) (*time.Time, error) {
 	lic, err := s.store.FindLicenseByID(ctx, licenseID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1045,7 +1052,35 @@ func (s *ReleaseService) FeedCutoffForToken(ctx context.Context, licenseID, prod
 		!IsLicenseUsable(lic) {
 		return nil, licenseNotFound()
 	}
+	if err := s.refuseTokenDevice(ctx, licenseID, identifier); err != nil {
+		return nil, err
+	}
 	return lic.EffectiveUpdatesUntil(), nil
+}
+
+// refuseTokenDevice collapses a still-valid license token into
+// LICENSE_NOT_FOUND when its device is no longer activated or is on a
+// paused member seat, matching what Verify and FeedCutoff's key path
+// answer for that device.
+func (s *ReleaseService) refuseTokenDevice(ctx context.Context, licenseID, identifier string) error {
+	act, err := s.store.FindActivation(ctx, licenseID, identifier)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return licenseNotFound()
+		}
+		return apperr.Internal(err)
+	}
+	if act.SeatID == "" {
+		return nil
+	}
+	paused, err := s.store.SeatPaused(ctx, act.SeatID)
+	if err != nil {
+		return apperr.Internal(err)
+	}
+	if paused {
+		return licenseNotFound()
+	}
+	return nil
 }
 
 // ─── Helpers ───

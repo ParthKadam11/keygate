@@ -219,3 +219,138 @@ func TestFeedCutoff_MaintenancePeriod(t *testing.T) {
 		t.Fatalf("public feed: %v %v", versions(rels), err)
 	}
 }
+
+// A paused member's key is refused by FeedCutoff; a JWT they got while
+// active must not keep unlocking FeedCutoffForToken after the seat is
+// paused, nor after the device is released or the member removed (same
+// LICENSE_NOT_FOUND collapse).
+func TestFeedCutoffForToken_PausedMemberSeat(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
+	}
+	s, err := store.New(dsn)
+	if err != nil {
+		t.Skipf("skipping integration test: %v", err)
+	}
+	defer s.Close()
+	if err := s.RunMigrations("../../db/migrations"); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	ctx := context.Background()
+	suffix := strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
+	prod := &model.Product{Name: "Team feed", Slug: "feed-pause-" + suffix, Type: "hybrid"}
+	if err := s.CreateProduct(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+	plan := &model.Plan{
+		ProductID: prod.ID, Name: "Team", Slug: "feed-pause-" + suffix,
+		LicenseType: "subscription", LicenseModel: "standard",
+		MaxActivations: 2, MaxSeats: 1, PerSeat: true, MinQuantity: 1, MaxQuantity: 50, Active: true,
+	}
+	if err := s.CreatePlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	lic := &model.License{
+		ProductID: prod.ID, PlanID: plan.ID, Email: "owner-" + suffix + "@example.com",
+		LicenseKey: "KEY-feed-pause-" + suffix, Status: model.StatusActive, Quantity: 5,
+	}
+	if err := s.CreateLicense(ctx, lic); err != nil {
+		t.Fatal(err)
+	}
+
+	accept := func(who string) (*model.Seat, string) {
+		t.Helper()
+		plain, hash := store.GenerateSeatInviteToken()
+		expires := time.Now().Add(time.Hour)
+		seat := &model.Seat{
+			LicenseID: lic.ID, Email: who + "-" + suffix + "@example.com", Role: "member",
+			InviteTokenHash: hash, InviteExpiresAt: &expires,
+		}
+		if _, _, err := s.AddSeatWithinLimit(ctx, seat, 0); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.AcceptSeatInvite(ctx, plain); err != nil {
+			t.Fatal(err)
+		}
+		seat, err := s.FindSeatByID(ctx, seat.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := s.MemberKey(ctx, seat)
+		if err != nil || key == "" {
+			t.Fatalf("member key: %q %v", key, err)
+		}
+		return seat, key
+	}
+
+	var seats []*model.Seat
+	var keys []string
+	for _, who := range []string{"a", "b", "c"} {
+		seat, key := accept(who)
+		seats, keys = append(seats, seat), append(keys, key)
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Activate while everyone still has a seat, then shrink so c waits.
+	for i, device := range []string{"a-pc", "b-pc", "c-pc"} {
+		if err := s.ActivateForKey(ctx, &model.Activation{
+			LicenseID: lic.ID, Identifier: device, IdentifierType: "device", SeatID: seats[i].ID,
+		}, 10, keys[i]); err != nil {
+			t.Fatalf("activate %s: %v", device, err)
+		}
+	}
+	if _, err := s.DB.NewRaw("UPDATE licenses SET quantity = ? WHERE id = ?", 3, lic.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	paused, err := s.SeatPaused(ctx, seats[2].ID)
+	if err != nil || !paused {
+		t.Fatalf("c paused: %v %v", paused, err)
+	}
+
+	svc := NewReleaseService(ReleaseServiceConfig{Store: s, Logger: slog.Default()})
+	notFound := func(err error) bool {
+		var ae *apperr.AppError
+		return errors.As(err, &ae) && ae.Code == "LICENSE_NOT_FOUND"
+	}
+
+	if _, err := svc.FeedCutoff(ctx, keys[2], prod.ID); !notFound(err) {
+		t.Fatalf("paused member key feed = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "c-pc"); !notFound(err) {
+		t.Fatalf("paused member token feed = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "a-pc"); err != nil {
+		t.Fatalf("active member token feed: %v", err)
+	}
+	if _, err := svc.FeedCutoff(ctx, keys[0], prod.ID); err != nil {
+		t.Fatalf("active member key feed: %v", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "never-activated"); !notFound(err) {
+		t.Fatalf("token for a device not activated = %v, want LICENSE_NOT_FOUND", err)
+	}
+
+	// The owner's own device, then released.
+	if err := s.ActivateForKey(ctx, &model.Activation{
+		LicenseID: lic.ID, Identifier: "owner-pc", IdentifierType: "device",
+	}, 10, lic.LicenseKey); err != nil {
+		t.Fatalf("activate owner-pc: %v", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "owner-pc"); err != nil {
+		t.Fatalf("owner device token feed: %v", err)
+	}
+	if _, err := s.DB.NewRaw("DELETE FROM activations WHERE license_id = ? AND identifier = ?", lic.ID, "owner-pc").Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "owner-pc"); !notFound(err) {
+		t.Fatalf("released device token feed = %v, want LICENSE_NOT_FOUND", err)
+	}
+
+	// A removed member's devices go with them.
+	if _, _, err := s.RemoveSeat(ctx, seats[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "a-pc"); !notFound(err) {
+		t.Fatalf("removed member token feed = %v, want LICENSE_NOT_FOUND", err)
+	}
+}
