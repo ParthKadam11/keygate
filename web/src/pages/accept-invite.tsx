@@ -4,21 +4,28 @@ import { useEffect, useRef } from "react"
 import { Link, useSearchParams } from "react-router-dom"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { useAuth } from "@/hooks/use-auth"
 import { useSiteConfig } from "@/hooks/use-site-config"
 import { useI18n } from "@/i18n"
 import { errorCode, invites } from "@/lib/api"
 
 export default function AcceptInvitePage() {
   const { t } = useI18n()
+  const { refetch } = useAuth()
   const [params] = useSearchParams()
   const token = params.get("token") || ""
 
   // Backend collapses bad/expired/already-accepted into one error, so
   // the page tells apart only "no seat is free", whose invitation still
   // stands. It shows the failure itself; the global toast stays out.
+  // AcceptInvite also issues a session cookie (see AuthHandler.AcceptInvite);
+  // refetch so "Open portal" sees the invitee, same as signup/login.
   const acceptMut = useMutation({
     mutationFn: () => invites.accept(token),
     meta: { ownErrors: true },
+    onSuccess: async () => {
+      await refetch()
+    },
   })
 
   // Fire exactly once per distinct token. StrictMode double-invokes
