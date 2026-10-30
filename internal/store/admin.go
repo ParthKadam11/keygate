@@ -430,6 +430,9 @@ func (s *Store) FindLicenseByIDWithCounts(ctx context.Context, id string) (*mode
 	return l, nil
 }
 
+// ErrLicenseNotFound: no licence has the id given.
+var ErrLicenseNotFound = errors.New("license not found")
+
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
 	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
 		res, err := tx.NewUpdate().Model((*model.License)(nil)).
@@ -440,7 +443,7 @@ func (s *Store) RevokeLicense(ctx context.Context, id string) error {
 		}
 		n, _ := res.RowsAffected()
 		if n == 0 {
-			return fmt.Errorf("license not found")
+			return ErrLicenseNotFound
 		}
 		if _, err := tx.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
 			return err
@@ -471,10 +474,13 @@ func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 		n, _ := res.RowsAffected()
 		if n == 0 {
 			var exists bool
-			if err := tx.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err == nil && exists {
+			if err := tx.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err != nil {
+				return err
+			}
+			if exists {
 				return ErrLicenseNotSuspendable
 			}
-			return fmt.Errorf("license not found")
+			return ErrLicenseNotFound
 		}
 		return syncSubscriptionStatus(ctx, tx, id, model.StatusSuspended)
 	})

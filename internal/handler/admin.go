@@ -2845,7 +2845,11 @@ func (h *AdminHandler) RevokeLicense(c *gin.Context) {
 		return
 	}
 	if err := h.Store.RevokeLicense(c, id); err != nil {
-		response.NotFound(c, err.Error())
+		if errors.Is(err, store.ErrLicenseNotFound) {
+			response.NotFound(c, err.Error())
+			return
+		}
+		response.Internal(c, err)
 		return
 	}
 	h.Store.Audit(c, &model.AuditLog{
@@ -2957,7 +2961,11 @@ func (h *AdminHandler) SuspendLicense(c *gin.Context) {
 			response.Conflict(c, "LICENSE_NOT_SUSPENDABLE", err.Error(), nil)
 			return
 		}
-		response.NotFound(c, err.Error())
+		if errors.Is(err, store.ErrLicenseNotFound) {
+			response.NotFound(c, err.Error())
+			return
+		}
+		response.Internal(c, err)
 		return
 	}
 	h.Store.Audit(c, &model.AuditLog{

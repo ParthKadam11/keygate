@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,8 +74,8 @@ func TestRevokeLicense_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	err := s.RevokeLicense(ctx, "nonexistent-id")
-	if err == nil || err.Error() != "license not found" {
-		t.Fatalf("err = %v, want 'license not found'", err)
+	if !errors.Is(err, store.ErrLicenseNotFound) {
+		t.Fatalf("err = %v, want ErrLicenseNotFound", err)
 	}
 }
 
@@ -108,7 +110,47 @@ func TestSuspendLicense_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	err := s.SuspendLicense(ctx, "nonexistent-id")
-	if err == nil || err.Error() != "license not found" {
-		t.Fatalf("err = %v, want 'license not found'", err)
+	if !errors.Is(err, store.ErrLicenseNotFound) {
+		t.Fatalf("err = %v, want ErrLicenseNotFound", err)
+	}
+}
+
+// A failed subscription update undoes the whole revoke: the licence is
+// not left revoked with its devices gone and its subscription active.
+func TestRevokeLicense_FailedSubscriptionSyncRollsBack(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+	lic := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	if err := s.CreateActivation(ctx, &model.Activation{LicenseID: lic.ID, Identifier: "machine-1", IdentifierType: "device"}); err != nil {
+		t.Fatal(err)
+	}
+
+	fn := "fail_revoke_" + strings.ReplaceAll(lic.ID, "-", "")
+	if _, err := s.DB.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'database unavailable'; END $$`, fn)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB.ExecContext(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON subscriptions", fn))
+		_, _ = s.DB.ExecContext(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", fn))
+	})
+	if _, err := s.DB.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON subscriptions FOR EACH ROW
+		WHEN (NEW.license_id = '%s') EXECUTE FUNCTION %s()`, fn, lic.ID, fn)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.RevokeLicense(ctx, lic.ID)
+	if !strings.Contains(fmt.Sprint(err), "database unavailable") {
+		t.Fatalf("err = %v, want the trigger's error", err)
+	}
+	if st, _ := licenseState(t, s, ctx, lic.ID); st != model.StatusActive {
+		t.Errorf("license status = %s, want it still active", st)
+	}
+	if st, _ := subscriptionState(t, s, ctx, lic.ID); st != model.StatusActive {
+		t.Errorf("subscription status = %s, want it still active", st)
+	}
+	if n, err := s.CountActivations(ctx, lic.ID); err != nil || n != 1 {
+		t.Errorf("activations = %d (err %v), want the device kept", n, err)
 	}
 }
