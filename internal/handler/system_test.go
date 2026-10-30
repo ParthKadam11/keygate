@@ -20,9 +20,16 @@ func TestSemverNewer(t *testing.T) {
 		{"1.0.10", "1.0.9", true},
 		{"10.0.0", "9.0.0", true},
 
-		// Pre-release suffix stripped
+		// Pre-release comparisons per SemVer 2.0
 		{"1.1.0-beta", "1.0.0", true},
-		{"1.0.0", "1.0.0-beta", false}, // both parse to 1.0.0
+		{"1.0.0", "1.0.0-beta", true}, // stable release ranks above pre-release
+		{"1.0.0-rc.2", "1.0.0-rc.1", true},
+		{"1.0.0-rc.1", "1.0.0-rc.2", false},
+
+		// Build metadata ignored for precedence
+		{"1.0.1+build", "1.0.0", true},
+		{"1.0.1", "1.0.1+build", false},
+		{"1.0.1+build2", "1.0.1+build1", false},
 
 		// Edge cases
 		{"", "1.0.0", false},
@@ -33,6 +40,20 @@ func TestSemverNewer(t *testing.T) {
 		// Partial versions
 		{"1.1", "1.0", true},
 		{"1", "0", true},
+		{"1.1+build-x", "1.0", true},
+
+		// A build from source: `git describe --tags --dirty` is the
+		// tag or later, never a pre-release of it
+		{"0.1.19", "0.1.19-3-gabc1234", false},
+		{"0.1.19", "0.1.19-dirty", false},
+		{"0.1.19", "0.1.19-3-gabc1234-dirty", false},
+		{"0.1.19", "0.1.18-12-g0123abc", true},
+		{"0.1.20", "0.1.19-3-gabc1234", true},
+		{"0.2.0", "0.2.0-rc.1-3-gabc1234", true},
+		{"0.1.19", "0.2.0-rc.1-3-gabc1234", false},
+		// No tag at all: `--always` gives the bare hash
+		{"0.1.19", "abc1234", false},
+		{"0.1.19", "abc1234-dirty", false},
 	}
 
 	for _, tt := range tests {

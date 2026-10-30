@@ -4,12 +4,14 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"strconv"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/mod/semver"
+
 	"github.com/tabloy/keygate/internal/branding"
 	"github.com/tabloy/keygate/internal/store"
 	"github.com/tabloy/keygate/internal/version"
@@ -161,31 +163,48 @@ func (h *SystemHandler) fetchLatestRelease() *updateInfo {
 	return info
 }
 
+// normalizeSemver pads partial versions (e.g. "1" -> "v1.0.0", "1.1" -> "v1.1.0")
+// and ensures a "v" prefix so that golang.org/x/mod/semver can parse it per SemVer 2.0.
+func normalizeSemver(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	// The core ends at the first "-" (pre-release) or "+" (build).
+	i := strings.IndexAny(v, "-+")
+	if i < 0 {
+		i = len(v)
+	}
+	base, suffix := v[:i], v[i:]
+	switch strings.Count(base, ".") {
+	case 0:
+		base += ".0.0"
+	case 1:
+		base += ".0"
+	}
+	return base + suffix
+}
+
+// describeSuffix is what `git describe --tags --dirty`, the Makefile's
+// version, adds after the tag: the commits since it with the commit's
+// hash, and a mark for uncommitted changes. A build carrying it is the
+// tag or later, never a pre-release of it as semver would read it.
+var describeSuffix = regexp.MustCompile(`(-[0-9]+-g[0-9a-f]+)?(-dirty)?$`)
+
 // semverNewer returns true if latest > current using semantic versioning.
 func semverNewer(latest, current string) bool {
 	if latest == "" || current == "" || current == "dev" {
 		return false
 	}
-	lp := parseSemver(latest)
-	cp := parseSemver(current)
-	if lp[0] != cp[0] {
-		return lp[0] > cp[0]
+	vl := normalizeSemver(latest)
+	vc := normalizeSemver(describeSuffix.ReplaceAllString(current, ""))
+	if !semver.IsValid(vl) || !semver.IsValid(vc) {
+		return false
 	}
-	if lp[1] != cp[1] {
-		return lp[1] > cp[1]
-	}
-	return lp[2] > cp[2]
-}
-
-func parseSemver(v string) [3]int {
-	parts := strings.SplitN(v, ".", 3)
-	var result [3]int
-	for i := 0; i < 3 && i < len(parts); i++ {
-		// Strip pre-release suffix (e.g. "1-beta" → "1")
-		num, _, _ := strings.Cut(parts[i], "-")
-		result[i], _ = strconv.Atoi(num)
-	}
-	return result
+	return semver.Compare(vl, vc) > 0
 }
 
 func stripV(v string) string {
