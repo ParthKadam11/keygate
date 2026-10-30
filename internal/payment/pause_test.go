@@ -124,7 +124,9 @@ func TestStripePauseClearsFloatingSessions(t *testing.T) {
 		LicenseID: lic.ID, Identifier: "machine-a",
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
-	if _, err := f.h.Store.CheckOutFloatingWithLimit(f.ctx, sess, 5); err != nil {
+	// CheckOutFloating, not WithLimit: seedPlan leaves MaxActivations=0,
+	// which clamps the limit path to zero sessions before we can pause.
+	if err := f.h.Store.CheckOutFloating(f.ctx, sess); err != nil {
 		t.Fatal(err)
 	}
 	f.stripeSays(lic, "paused")

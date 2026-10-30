@@ -133,7 +133,9 @@ func TestSubscriptionStatusWrite_DeletesFloatingWhenUnusable(t *testing.T) {
 			LicenseID: licID, Identifier: "ws-1",
 			ExpiresAt: time.Now().Add(time.Hour),
 		}
-		if _, err := s.CheckOutFloatingWithLimit(ctx, sess, 5); err != nil {
+		// CheckOutFloating, not WithLimit: newLicenseOn plans default to
+		// MaxActivations=0, which clamps the limit path to zero sessions.
+		if err := s.CheckOutFloating(ctx, sess); err != nil {
 			t.Fatal(err)
 		}
 	}
