@@ -666,8 +666,21 @@ func (s *Store) GetRetentionData(ctx context.Context, productID string, months i
 		months = 6
 	}
 	var out []RetentionData
-	q := s.DB.NewSelect().
+	// One row per day: the products added up, as the snapshot chart
+	// does. Taken over the per-product rows, the month's largest total
+	// and largest active count could come from two different products.
+	daily := s.DB.NewSelect().
 		TableExpr("analytics_snapshots").
+		ColumnExpr("date").
+		ColumnExpr("SUM(total_licenses) AS total_licenses").
+		ColumnExpr("SUM(active_licenses) AS active_licenses").
+		Where(fmt.Sprintf("date >= now() - interval '%d months'", months)).
+		GroupExpr("date")
+	if productID != "" {
+		daily = daily.Where("product_id = ?", productID)
+	}
+	q := s.DB.NewSelect().
+		TableExpr("(?) AS daily", daily).
 		// to_char, not ::text: Postgres renders a timestamptz as
 		// "2026-09-01 00:00:00+00", which is neither RFC 3339 nor the
 		// shape every other date in this API has. The bucket is a
@@ -683,12 +696,8 @@ func (s *Store) GetRetentionData(ctx context.Context, productID string, months i
 			THEN ROUND((1 - MAX(active_licenses)::numeric / MAX(total_licenses)) * 100, 1)
 			ELSE 0
 		END AS churn_pct`).
-		Where(fmt.Sprintf("date >= now() - interval '%d months'", months)).
 		GroupExpr("date_trunc('month', date)").
 		OrderExpr("period ASC")
-	if productID != "" {
-		q = q.Where("product_id = ?", productID)
-	}
 	err := q.Scan(ctx, &out)
 	return out, err
 }
