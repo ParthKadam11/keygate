@@ -1308,6 +1308,18 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 		if err := syncSubscriptionStatus(ctx, tx, lic.ID, lic.Status); err != nil {
 			return err
 		}
+		// Same as revoke: drop floating leases when this write makes the
+		// licence unusable, so a later resume cannot revive a pre-pause
+		// session or keep counting it toward the cap while it was
+		// paused or canceled. past_due stays usable, so its sessions
+		// stay. Device activations stay — a pause is temporary and
+		// resume should not force every machine to re-activate.
+		switch lic.Status {
+		case model.StatusSuspended, model.StatusCanceled, model.StatusExpired, model.StatusRevoked:
+			if _, err := tx.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", lic.ID).Exec(ctx); err != nil {
+				return err
+			}
+		}
 	}
 	// The subscription row names the plan too; a plan the licence moved
 	// to in Stripe moves it with the licence, or the two disagree.

@@ -114,6 +114,42 @@ func (f *pauseFixture) audits(lic *model.License, action string, want int) int {
 	return n
 }
 
+// A pause ends floating leases with the licence: a resume before the
+// lease would have expired must not let the same machine heartbeat
+// without checking out again.
+func TestStripePauseClearsFloatingSessions(t *testing.T) {
+	f := newPauseFixture(t)
+	lic := f.licence("float", model.StatusActive, "")
+	sess := &model.FloatingSession{
+		LicenseID: lic.ID, Identifier: "machine-a",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if _, err := f.h.Store.CheckOutFloatingWithLimit(f.ctx, sess, 5); err != nil {
+		t.Fatal(err)
+	}
+	f.stripeSays(lic, "paused")
+	f.event(lic)
+	if st := f.state(lic); st != "suspended:stripe" {
+		t.Fatalf("after the pause: %s, want suspended by stripe", st)
+	}
+	n, err := f.h.Store.CountActiveFloating(f.ctx, lic.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("floating sessions after pause = %d, want 0", n)
+	}
+	f.stripeSays(lic, "active")
+	f.event(lic)
+	renewed, err := f.h.Store.HeartbeatFloating(f.ctx, lic.ID, "machine-a", "", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed {
+		t.Fatal("heartbeat renewed a lease the pause had cleared")
+	}
+}
+
 // A pause and a resume are read as Stripe has the subscription now: the
 // pause suspends the licence and is told once, the resume lifts it, and
 // a pause delivered after the resume changes nothing. An operator's

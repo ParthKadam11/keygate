@@ -118,6 +118,76 @@ func TestDateOnlyWriteKeepsTheSubscriptionStatus(t *testing.T) {
 	}
 }
 
+// A subscription write that makes the licence unusable (pause, cancel)
+// ends its floating leases with it, as revoke does: a resume must not
+// revive a pre-pause session or hold capacity. past_due stays usable,
+// so its sessions stay.
+func TestSubscriptionStatusWrite_DeletesFloatingWhenUnusable(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+
+	checkout := func(licID string) {
+		t.Helper()
+		sess := &model.FloatingSession{
+			LicenseID: licID, Identifier: "ws-1",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}
+		if _, err := s.CheckOutFloatingWithLimit(ctx, sess, 5); err != nil {
+			t.Fatal(err)
+		}
+	}
+	activeCount := func(licID string) int {
+		t.Helper()
+		n, err := s.CountActiveFloating(ctx, licID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	paused := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	psub := "sub_float_pause_" + paused.ID
+	linkSubscription(t, s, ctx, paused.ID, psub)
+	checkout(paused.ID)
+	now := time.Now()
+	if err := s.UpdateLicenseFromSubscription(ctx, &model.License{
+		ID: paused.ID, StripeSubscriptionID: psub, Status: model.StatusSuspended,
+		SuspendedAt: &now, SuspendedBy: model.SuspendedByStripe,
+	}, "status", "suspended_at", "suspended_by"); err != nil {
+		t.Fatal(err)
+	}
+	if n := activeCount(paused.ID); n != 0 {
+		t.Fatalf("after Stripe pause: %d floating sessions, want 0", n)
+	}
+
+	canceled := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	csub := "sub_float_cancel_" + canceled.ID
+	linkSubscription(t, s, ctx, canceled.ID, csub)
+	checkout(canceled.ID)
+	if err := s.UpdateLicenseFromSubscriptionEnded(ctx, &model.License{
+		ID: canceled.ID, StripeSubscriptionID: csub, Status: model.StatusCanceled, CanceledAt: &now,
+	}, now, "status", "canceled_at"); err != nil {
+		t.Fatal(err)
+	}
+	if n := activeCount(canceled.ID); n != 0 {
+		t.Fatalf("after subscription end: %d floating sessions, want 0", n)
+	}
+
+	pastDue := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	dsub := "sub_float_pd_" + pastDue.ID
+	linkSubscription(t, s, ctx, pastDue.ID, dsub)
+	checkout(pastDue.ID)
+	if err := s.UpdateLicenseFromSubscription(ctx, &model.License{
+		ID: pastDue.ID, StripeSubscriptionID: dsub, Status: model.StatusPastDue, PastDueAt: &now,
+	}, "status", "past_due_at"); err != nil {
+		t.Fatal(err)
+	}
+	if n := activeCount(pastDue.ID); n != 1 {
+		t.Fatalf("after past_due: %d floating sessions, want 1 (still usable)", n)
+	}
+}
+
 // The terms write finds a licence that is gone unlinked, like every
 // other subscription write: the event is done, not retried.
 func TestTermsWriteOnAGoneLicenceIsUnlinked(t *testing.T) {
