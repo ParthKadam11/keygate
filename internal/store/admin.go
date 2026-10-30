@@ -482,6 +482,14 @@ func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 			}
 			return ErrLicenseNotFound
 		}
+		// Same as revoke: drop floating leases so reinstate cannot revive
+		// a pre-suspend session or keep counting it toward the cap while
+		// the licence was unusable. Device activations stay — suspend is
+		// temporary and reinstate should not force every machine to
+		// re-activate.
+		if _, err := tx.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
 		return syncSubscriptionStatus(ctx, tx, id, model.StatusSuspended)
 	})
 }
@@ -821,6 +829,12 @@ func (s *Store) expireLicenseWhere(ctx context.Context, id string, cond func(*bu
 			return nil
 		}
 		ok = true
+		// Match revoke: end floating leases with the expiry so a later
+		// reinstate or valid_until extension cannot revive them or hold
+		// capacity. Activations are swept by DeleteExpiredActivations.
+		if _, err := tx.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
 		return syncSubscriptionStatus(ctx, tx, id, model.StatusExpired)
 	})
 	return ok, err

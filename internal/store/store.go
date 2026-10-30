@@ -1692,7 +1692,9 @@ func (s *Store) FindStalePastDueLicenses(ctx context.Context, before time.Time) 
 	return out, err
 }
 
-// DeleteExpiredActivations removes activations for expired/revoked licenses.
+// DeleteExpiredActivations removes activations for expired/revoked licenses,
+// and any floating sessions still attached to those licenses (a safety net
+// for rows left before expire/revoke cleared them in the same write).
 func (s *Store) DeleteExpiredActivations(ctx context.Context) (int, error) {
 	res, err := s.DB.NewDelete().
 		TableExpr("activations").
@@ -1702,6 +1704,11 @@ func (s *Store) DeleteExpiredActivations(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
+	if _, err := s.DB.NewDelete().Model((*model.FloatingSession)(nil)).
+		Where("license_id IN (SELECT id FROM licenses WHERE status IN ('expired', 'revoked'))").
+		Exec(ctx); err != nil {
+		return int(n), err
+	}
 	return int(n), nil
 }
 
