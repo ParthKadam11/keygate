@@ -431,19 +431,25 @@ func (s *Store) FindLicenseByIDWithCounts(ctx context.Context, id string) (*mode
 }
 
 func (s *Store) RevokeLicense(ctx context.Context, id string) error {
-	_, _ = s.DB.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx)
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, updated_at = ?", model.StatusRevoked, time.Now()).
-		Where("id = ?", id).Exec(ctx)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusRevoked, id).Exec(ctx)
-	return nil
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?, updated_at = now()", model.StatusRevoked).
+			Where("id = ?", id).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("license not found")
+		}
+		if _, err := tx.NewDelete().Model((*model.Activation)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
+		if _, err := tx.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", id).Exec(ctx); err != nil {
+			return err
+		}
+		return syncSubscriptionStatus(ctx, tx, id, model.StatusRevoked)
+	})
 }
 
 // ErrLicenseNotSuspendable refuses to suspend a licence that is not in
@@ -453,24 +459,25 @@ var ErrLicenseNotSuspendable = errors.New("only an active, trialing or past-due 
 
 func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 	now := time.Now()
-	res, err := s.DB.NewUpdate().Model((*model.License)(nil)).
-		Set("status = ?, suspended_at = ?, suspended_by = ?, updated_at = ?", model.StatusSuspended, now, model.SuspendedByAdmin, now).
-		Where("id = ?", id).
-		Where("status IN (?)", bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).
-		Exec(ctx)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		var exists bool
-		if err := s.DB.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err == nil && exists {
-			return ErrLicenseNotSuspendable
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewUpdate().Model((*model.License)(nil)).
+			Set("status = ?, suspended_at = ?, suspended_by = ?, updated_at = ?", model.StatusSuspended, now, model.SuspendedByAdmin, now).
+			Where("id = ?", id).
+			Where("status IN (?)", bun.In([]string{model.StatusActive, model.StatusTrialing, model.StatusPastDue})).
+			Exec(ctx)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("license not found")
-	}
-	_, _ = s.DB.NewRaw(`UPDATE subscriptions SET status = ?, updated_at = now() WHERE license_id = ?`, model.StatusSuspended, id).Exec(ctx)
-	return nil
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			var exists bool
+			if err := tx.NewRaw("SELECT EXISTS (SELECT 1 FROM licenses WHERE id = ?)", id).Scan(ctx, &exists); err == nil && exists {
+				return ErrLicenseNotSuspendable
+			}
+			return fmt.Errorf("license not found")
+		}
+		return syncSubscriptionStatus(ctx, tx, id, model.StatusSuspended)
+	})
 }
 
 // usableStatusSQL is the status a usable licence takes back: "trialing"
