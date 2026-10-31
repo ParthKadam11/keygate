@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,96 +100,6 @@ func (h *StripeHandler) SetWebhookSecret(secret string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.webhookSecret = secret
-}
-
-// isSameOrigin checks that a URL shares the same scheme+host as BaseURL
-// and has no userinfo (to prevent https://evil.com@legit.com bypasses).
-func (h *StripeHandler) isSameOrigin(raw string) bool {
-	base, err := url.Parse(h.BaseURL)
-	if err != nil {
-		return false
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	return u.Scheme == base.Scheme && u.Host == base.Host && u.User == nil
-}
-
-func (h *StripeHandler) CreateCheckoutSession(c *gin.Context) {
-	var req struct {
-		PriceID    string `json:"price_id" binding:"required"`
-		Email      string `json:"email"`
-		SuccessURL string `json:"success_url"`
-		CancelURL  string `json:"cancel_url"`
-		// Quantity is the seats to start a plan sold per seat with;
-		// 0 means the plan's minimum.
-		Quantity int `json:"quantity"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "price_id is required")
-		return
-	}
-
-	plan, err := h.Store.FindPlanByStripePrice(c, req.PriceID)
-	if err != nil || plan == nil {
-		response.BadRequest(c, "invalid price_id")
-		return
-	}
-	if !h.sellableNow(c, plan) {
-		return
-	}
-
-	success := h.BaseURL + "/checkout/success?session_id={CHECKOUT_SESSION_ID}"
-	if req.SuccessURL != "" && h.isSameOrigin(req.SuccessURL) {
-		success = req.SuccessURL
-	}
-	cancel := h.BaseURL + "/pricing"
-	if req.CancelURL != "" && h.isSameOrigin(req.CancelURL) {
-		cancel = req.CancelURL
-	}
-
-	mode := string(stripe.CheckoutSessionModeSubscription)
-	if plan.LicenseType == "perpetual" {
-		mode = string(stripe.CheckoutSessionModePayment)
-	}
-	// Whether the price is metered is Stripe's to say: it decides how the
-	// line item is written (see checkoutLineItem).
-	sp, err := stripeprice.Get(req.PriceID, nil)
-	if err != nil {
-		slog.Error("stripe: failed to fetch price", "price_id", req.PriceID, "error", err)
-		response.Err(c, http.StatusServiceUnavailable, "PAYMENT_CONFIG_ERROR", "payment configuration error")
-		return
-	}
-	item, err := checkoutLineItem(plan, req.PriceID, mode == string(stripe.CheckoutSessionModeSubscription), priceMetered(sp), req.Quantity)
-	if err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-
-	params := &stripe.CheckoutSessionParams{
-		Mode:                stripe.String(mode),
-		LineItems:           []*stripe.CheckoutSessionLineItemParams{item},
-		SuccessURL:          stripe.String(success),
-		CancelURL:           stripe.String(cancel),
-		AllowPromotionCodes: stripe.Bool(true),
-	}
-	params.Metadata = map[string]string{
-		"plan_id":       plan.ID,
-		"product_id":    plan.ProductID,
-		metaUpdatesDays: strconv.Itoa(plan.UpdatesDays),
-		metaLicenseType: plan.LicenseType,
-	}
-	if req.Email != "" {
-		params.CustomerEmail = stripe.String(req.Email)
-	}
-
-	s, err := session.New(params)
-	if err != nil {
-		response.Internal(c, err)
-		return
-	}
-	response.OK(c, gin.H{"url": s.URL, "session_id": s.ID})
 }
 
 // CheckoutByPlan handles GET /pay/:checkout_id — looks up plan by checkout_id,
@@ -1052,15 +961,6 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		// earlier unpaid completion or a racing worker goes away.
 		_ = h.Store.DeleteProcessedEvent(ctx, pendingSessionProvider, sessionID)
 	}
-	// The subscription is read again now that the licence exists. The
-	// read above came before it, and so may every event so far: the
-	// invoice that pays the first period, or a cancellation, finds no
-	// licence and is dropped, and nothing else would bring the licence
-	// in line until the next renewal. Events from here on find it. A
-	// read that fails leaves the cancel state to SyncCancelStates, and
-	// the rest as the read above set it.
-	h.followNewSubscription(ctx, lic)
-
 	// Link license to user
 	if u, err := h.Store.FindUserByEmail(ctx, email); err == nil {
 		lic.UserID = u.ID
@@ -1111,6 +1011,16 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 			"license_id": lic.ID, "email": lic.Email, "plan_id": lic.PlanID,
 		})
 	}
+
+	// The subscription is read again now that the licence exists. The
+	// read above came before it, and so may every event so far: the
+	// invoice that pays the first period, or a cancellation, finds no
+	// licence and is dropped, and nothing else would bring the licence
+	// in line until the next renewal. Events from here on find it. Read
+	// once the licence is told as created, so an end or a pause it finds
+	// is told after that, not before. A read that fails leaves the cancel
+	// state to SyncCancelStates, and the rest as the read above set it.
+	h.followNewSubscription(ctx, lic)
 
 	slog.Info("license created", "email", email, "plan", plan.Name, "source", source)
 	return true, nil
@@ -1271,7 +1181,22 @@ func (h *StripeHandler) FollowSubscription(ctx context.Context, lic *model.Licen
 		if err != nil {
 			return err
 		}
-		return h.syncFromCurrent(ctx, fresh, cur, asOf, "admin.reinstate")
+		// A downgrade Stripe has not made yet holds the plan and seats
+		// back; the status was written all the same.
+		if err := h.syncFromCurrent(ctx, fresh, cur, asOf, "admin.reinstate"); err != nil && !errors.Is(err, store.ErrTermsHeld) {
+			return err
+		}
+		// Past due as it comes back: the failed payment was not reported
+		// while the licence was suspended, its event refused. It is now,
+		// once per episode, as invoice.payment_failed reports it.
+		now, err := h.Store.FindLicenseByID(ctx, lic.ID)
+		if err != nil {
+			return err
+		}
+		if now.Status == model.StatusPastDue && now.PastDueAt != nil {
+			return h.notifyPaymentFailed(ctx, now, lic.StripeSubscriptionID)
+		}
+		return nil
 	}, nil
 }
 
@@ -2336,8 +2261,12 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 		return err
 	}
 	lic.Status = model.StatusCanceled
-	now := time.Now()
-	lic.CanceledAt = &now
+	// When it ended stays when it first did: a deletion delivered again
+	// does not move it.
+	if lic.CanceledAt == nil {
+		now := time.Now()
+		lic.CanceledAt = &now
+	}
 	lic.PastDueAt = nil
 	// Deletion is final: the write always applies. The end is told here
 	// unless the licence was already canceled (by an unpaid or canceled
@@ -3079,11 +3008,13 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 		// Stripe answers 404 to cancelling a subscription that already
 		// ended, which is the end asked for. Only Stripe saying so counts:
 		// a key that cannot see a subscription answers the same way.
+		alreadyEnded := false
 		if _, err = subscription.Cancel(lic.StripeSubscriptionID, nil); err != nil {
 			ended, eerr := h.SubscriptionEnded(ctx, lic.StripeSubscriptionID)
 			var ae *apperr.AppError
 			switch {
 			case eerr == nil && ended:
+				alreadyEnded = true
 			case errors.As(eerr, &ae):
 				response.Err(c, ae.Status, ae.Code, ae.Message)
 				return
@@ -3091,6 +3022,13 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 				response.Internal(c, err)
 				return
 			}
+		}
+		// Ended before this cancel, and the licence with it (a second
+		// click, or the deletion got here first): the cancel was asked and
+		// told then, and nothing is written or told again.
+		if alreadyEnded && lic.Status == model.StatusCanceled {
+			response.OK(c, gin.H{"status": "canceled", "immediate": true})
+			return
 		}
 		// A licence an upgrade moved onto this subscription goes back to
 		// its free plan, as the deletion would put it: it has not ended,

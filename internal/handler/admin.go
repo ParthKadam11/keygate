@@ -3185,7 +3185,13 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 	}
 	status, err := h.Store.ReinstateLicense(c, id)
 	if errors.Is(err, store.ErrReinstateNeedsNewExpiry) {
-		response.Conflict(c, "EXPIRY_PASSED", err.Error(), nil)
+		// A Stripe-billed licence takes no expiry date from here: it
+		// ended with its subscription.
+		msg := err.Error()
+		if lic != nil && lic.StripeSubscriptionID != "" {
+			msg = "this license's Stripe subscription has ended, so it cannot be reinstated: unlink it from Stripe to set an expiry date here, or the customer subscribes again"
+		}
+		response.Conflict(c, "EXPIRY_PASSED", msg, nil)
 		return
 	}
 	if errors.Is(err, store.ErrLicenseNotReinstatable) {

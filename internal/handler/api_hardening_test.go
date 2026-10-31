@@ -628,6 +628,17 @@ func TestReinstateOfAStripeLicenceFollowsStripe(t *testing.T) {
 	if d["status"] != model.StatusSuspended || d["usable"] != false || !strings.Contains(fmt.Sprint(d["notice"]), "paused") {
 		t.Fatalf("paused in Stripe meanwhile: %v, want suspended, not usable, and a notice saying it is paused", d)
 	}
+
+	// Ended with its subscription: no expiry date can be set on it here,
+	// so the answer does not offer one.
+	if _, err := f.s.DB.NewRaw("UPDATE licenses SET status = 'canceled', suspended_by = NULL, suspended_at = NULL, canceled_at = now(), valid_until = now() - interval '1 hour' WHERE id = ?", f.licA.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	code, out = reinstate()
+	e, _ := out["error"].(map[string]any)
+	if code != http.StatusConflict || errCode(out) != "EXPIRY_PASSED" || !strings.Contains(fmt.Sprint(e["message"]), "unlink") {
+		t.Fatalf("ended with its subscription: %d %v, want 409 EXPIRY_PASSED saying to unlink", code, out)
+	}
 }
 
 // The seats a licence holds travel with it in both export formats.

@@ -44,6 +44,23 @@ func TestSubscriptionEndEndsAccessNow(t *testing.T) {
 		}
 	}
 
+	// A deletion delivered again leaves when it ended as it was.
+	first, err := f.h.Store.FindLicenseByID(f.ctx, deleted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.onSubscriptionDeleted(f.ctx, []byte(fmt.Sprintf(`{"id":%q}`, deleted.StripeSubscriptionID))); err != nil {
+		t.Fatal(err)
+	}
+	again, err := f.h.Store.FindLicenseByID(f.ctx, deleted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.CanceledAt == nil || again.CanceledAt == nil || !again.CanceledAt.Equal(*first.CanceledAt) || !again.ValidUntil.Equal(*first.ValidUntil) {
+		t.Errorf("deletion delivered again: canceled %v until %v, want %v until %v unchanged",
+			again.CanceledAt, again.ValidUntil, first.CanceledAt, first.ValidUntil)
+	}
+
 	// An expiry already behind stays where it was: the end of a period
 	// cancelled ahead, which the deletion arrives after.
 	lapsed := f.licence("lapsed", model.StatusActive, "valid_until = date_trunc('second', now()) - interval '1 hour'")
@@ -116,11 +133,26 @@ func TestReinstateFollowsTheSubscription(t *testing.T) {
 		t.Errorf("ended while suspended: %s until %v; want canceled and not usable", got.Status, got.ValidUntil)
 	}
 
-	// Past due meanwhile: within dunning, usable.
+	// Past due meanwhile: within dunning, usable, and the failed payment,
+	// whose event the suspension refused, is reported once.
 	pastDue := f.licence("pastdue", model.StatusSuspended, suspended)
 	f.stripeSays(pastDue, "past_due")
 	if got := reinstate(pastDue); got.Status != model.StatusPastDue || got.PastDueAt == nil || !service.IsLicenseUsable(got) {
 		t.Errorf("past due while suspended: %s since %v; want past due and usable", got.Status, got.PastDueAt)
+	}
+	failures := func(lic *model.License) int {
+		t.Helper()
+		var n int
+		if err := f.h.Store.DB.NewRaw("SELECT count(*) FROM notifications WHERE license_id = ? AND tag LIKE 'payment_failed:%'", lic.ID).Scan(f.ctx, &n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := failures(pastDue); n != 1 {
+		t.Errorf("past due once reinstated: %d payment failures reported, want 1", n)
+	}
+	if n := failures(renewed); n != 0 {
+		t.Errorf("renewed once reinstated: %d payment failures reported, want none", n)
 	}
 }
 
@@ -194,7 +226,23 @@ func TestPortalImmediateCancelOfAnEndedSubscription(t *testing.T) {
 	if w := cancel(); w.Code != http.StatusOK {
 		t.Fatalf("cancel of an ended subscription = %d %s, want 200", w.Code, w.Body.String())
 	}
-	if got := f.reload(t); got.Status != model.StatusCanceled || service.IsLicenseUsable(got) {
+	got := f.reload(t)
+	if got.Status != model.StatusCanceled || service.IsLicenseUsable(got) {
 		t.Fatalf("after the cancel: %s, usable %v; want canceled", got.Status, service.IsLicenseUsable(got))
+	}
+
+	// Asked again: answered as done, with nothing written or told again.
+	if w := cancel(); w.Code != http.StatusOK {
+		t.Fatalf("second cancel = %d %s, want 200", w.Code, w.Body.String())
+	}
+	again := f.reload(t)
+	if again.Status != model.StatusCanceled || !again.CanceledAt.Equal(*got.CanceledAt) || !again.ValidUntil.Equal(*got.ValidUntil) {
+		t.Fatalf("second cancel moved the licence: canceled %v until %v, want %v until %v",
+			again.CanceledAt, again.ValidUntil, got.CanceledAt, got.ValidUntil)
+	}
+	time.Sleep(500 * time.Millisecond) // audit lines land in the background
+	var n int
+	if err := f.s.DB.NewRaw("SELECT count(*) FROM audit_logs WHERE entity_id = ? AND action = 'cancel_requested'", f.lic.ID).Scan(f.ctx, &n); err != nil || n != 1 {
+		t.Fatalf("%d cancel_requested lines (%v), want 1", n, err)
 	}
 }

@@ -3,9 +3,11 @@ package payment
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/stripe/stripe-go/v82"
 
 	"github.com/tabloy/keygate/internal/model"
+	"github.com/tabloy/keygate/internal/service"
 )
 
 // A licence issued for a subscription starts as the subscription is:
@@ -62,7 +65,14 @@ func TestSubscriptionLicenceStartsFromItsSubscription(t *testing.T) {
 			"items":{"object":"list","data":[{"id":"si_1","quantity":1,"current_period_end":%d,"price":{"id":%q,"object":"price"}}]}}`,
 			id, status, end.Unix(), price)
 	}
-	h := &StripeHandler{Store: s}
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer receiver.Close()
+	hook := &model.Webhook{ProductID: prod.ID, URL: receiver.URL, Secret: "whsec_start", Active: true,
+		Events: []string{model.EventLicenseCanceled, "license.created"}}
+	if err := s.CreateWebhook(ctx, hook); err != nil {
+		t.Fatal(err)
+	}
+	h := &StripeHandler{Store: s, WebhookSvc: service.NewWebhookService(s, slog.Default(), 5*time.Second, 1, true)}
 	issue := func(name string) *model.License {
 		t.Helper()
 		subID := "sub_start_" + name + "_" + suffix
@@ -92,8 +102,19 @@ func TestSubscriptionLicenceStartsFromItsSubscription(t *testing.T) {
 	// Cancelled in Stripe before the licence existed, its deletion
 	// dropped for want of a licence: the read once issued ends it.
 	answers["sub_start_gone_"+suffix] = []string{sub("sub_start_gone_"+suffix, "active", firstEnd), sub("sub_start_gone_"+suffix, "canceled", firstEnd)}
-	if lic := issue("gone"); lic.Status != model.StatusCanceled || lic.ValidUntil == nil || lic.ValidUntil.After(time.Now()) {
-		t.Errorf("cancelled before issue: %s until %v, want canceled and ended", lic.Status, lic.ValidUntil)
+	gone := issue("gone")
+	if gone.Status != model.StatusCanceled || gone.ValidUntil == nil || gone.ValidUntil.After(time.Now()) {
+		t.Errorf("cancelled before issue: %s until %v, want canceled and ended", gone.Status, gone.ValidUntil)
+	}
+	// Told as created first, then as ended: a receiver that provisions on
+	// license.created does not provision a licence it was told had ended.
+	var events []string
+	if err := s.DB.NewRaw(`SELECT event FROM webhook_deliveries WHERE webhook_id = ? AND payload->'data'->>'license_id' = ?
+		ORDER BY created_at`, hook.ID, gone.ID).Scan(ctx, &events); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(events, []string{"license.created", model.EventLicenseCanceled}) {
+		t.Errorf("webhooks for a licence cancelled before issue = %v, want license.created then %s", events, model.EventLicenseCanceled)
 	}
 }
 
