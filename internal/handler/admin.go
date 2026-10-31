@@ -3188,8 +3188,12 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 		response.Conflict(c, "EXPIRY_PASSED", err.Error(), nil)
 		return
 	}
-	if err != nil {
+	if errors.Is(err, store.ErrLicenseNotReinstatable) {
 		response.BadRequest(c, err.Error())
+		return
+	}
+	if err != nil {
+		response.Internal(c, err)
 		return
 	}
 	h.Store.Audit(c, &model.AuditLog{

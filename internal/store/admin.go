@@ -524,6 +524,10 @@ const usableStatusSQL = `CASE WHEN COALESCE(licenses.stripe_subscription_id, '')
 // expiry date reactivates it instead (SetLicenseValidUntil).
 var ErrReinstateNeedsNewExpiry = errors.New("this license's expiry date has passed — set a new expiry date instead, which reactivates it")
 
+// ErrLicenseNotReinstatable refuses a reinstate the licence's current status
+// does not allow, or of a licence that does not exist.
+var ErrLicenseNotReinstatable = errors.New("license not found or cannot be reinstated from current status")
+
 // ReinstateLicense gives a suspended, expired or canceled licence back
 // and returns the status it now has. The licence and its subscription
 // row change in one transaction.
@@ -537,12 +541,21 @@ func (s *Store) ReinstateLicense(ctx context.Context, id string) (string, error)
 				(status IN ('expired', 'canceled') AND (valid_until IS NULL OR valid_until > now())))
 			RETURNING status`, id).Scan(ctx, &status)
 		if errors.Is(err, sql.ErrNoRows) {
+			// Why it was not reinstated: its expiry passed, or its status
+			// does not allow it, or there is no such licence. A read that
+			// failed is a failure, not a refusal.
 			var lapsed bool
-			if qerr := tx.NewRaw(`SELECT status IN ('expired', 'canceled') AND valid_until <= now()
-				FROM licenses WHERE id = ?`, id).Scan(ctx, &lapsed); qerr == nil && lapsed {
+			qerr := tx.NewRaw(`SELECT status IN ('expired', 'canceled') AND COALESCE(valid_until <= now(), false)
+				FROM licenses WHERE id = ?`, id).Scan(ctx, &lapsed)
+			switch {
+			case errors.Is(qerr, sql.ErrNoRows):
+				return ErrLicenseNotReinstatable
+			case qerr != nil:
+				return qerr
+			case lapsed:
 				return ErrReinstateNeedsNewExpiry
 			}
-			return fmt.Errorf("license not found or cannot be reinstated from current status")
+			return ErrLicenseNotReinstatable
 		}
 		if err != nil {
 			return err
