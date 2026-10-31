@@ -260,7 +260,8 @@ export default function WebhooksPage() {
                           <IconAction
                             label={t("webhooks.sendTest")}
                             onClick={() => testMut.mutate(wh.id)}
-                            disabled={testMut.isPending && testMut.variables === wh.id}
+                            // The server refuses a test of a disabled webhook.
+                            disabled={!wh.active || (testMut.isPending && testMut.variables === wh.id)}
                           >
                             <Send className="h-4 w-4" />
                           </IconAction>

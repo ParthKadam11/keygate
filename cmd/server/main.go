@@ -43,8 +43,11 @@ import (
 // credentialQueryParams are query parameters whose values must never
 // reach a log line. An updater sends a signed token this way when it
 // cannot set a header; the license key itself is refused in the URL,
-// but a client that tries still must not have it logged.
-var credentialQueryParams = []string{"license_key", "license_token"}
+// but a client that tries still must not have it logged. The invite
+// link (/accept-invite?token=) carries the claim token: a link scanner
+// fetching it leaves the token unspent, and whoever reads it in the log
+// could accept the invite. Names match whatever their case.
+var credentialQueryParams = []string{"license_key", "license_token", "token"}
 
 // credentialPathPrefixes name the routes that carry a credential as a
 // path segment rather than a parameter. The customer portal addresses
@@ -54,8 +57,10 @@ var credentialQueryParams = []string{"license_key", "license_token"}
 // holding a working credential.
 //
 // Each entry is the literal prefix up to and including the trailing
-// slash; the segment that follows it is the secret.
-var credentialPathPrefixes = []string{"/api/v1/portal/licenses/"}
+// slash; the segment that follows it is the secret. The second is the
+// same shape without the API prefix: no route serves it, but a request
+// for it is logged all the same.
+var credentialPathPrefixes = []string{"/api/v1/portal/licenses/", "/portal/licenses/"}
 
 // credentialPathSuffixes name the first segment of each continuation
 // that may follow the secret and be kept in a log line. Keeping the
@@ -84,14 +89,14 @@ var credentialPathSuffixes = map[string]bool{"activations": true}
 //
 // A new sub-route not listed above costs a little log detail until
 // someone adds it. The failure runs in the safe direction.
-func redactCredentialSegments(path string) string {
+func redactCredentialSegments(urlPath string) string {
 	for _, prefix := range credentialPathPrefixes {
-		if !strings.HasPrefix(path, prefix) {
+		if !strings.HasPrefix(urlPath, prefix) {
 			continue
 		}
-		rest := path[len(prefix):]
+		rest := urlPath[len(prefix):]
 		if rest == "" {
-			return path
+			return urlPath
 		}
 		secret, suffix, hasSuffix := strings.Cut(rest, "/")
 		// Only the first segment of the continuation is checked. The
@@ -104,7 +109,17 @@ func redactCredentialSegments(path string) string {
 		}
 		return prefix + "redacted"
 	}
-	return path
+	// A shape the router would not match, the prefix in another case or
+	// with an extra slash or dot segment in it (/api/v1//portal/...,
+	// /api/v1/Portal/...), still reaches the access log: the whole tail
+	// goes.
+	cleaned := strings.ToLower(path.Clean(urlPath))
+	for _, prefix := range credentialPathPrefixes {
+		if strings.HasPrefix(cleaned, prefix) && len(cleaned) > len(prefix) {
+			return prefix + "redacted"
+		}
+	}
+	return urlPath
 }
 
 // redactRequestPath renders one request's path and query for a log
@@ -139,10 +154,12 @@ func redactPath(path string) string {
 		return path[:i] + "?<redacted>"
 	}
 	redacted := false
-	for _, name := range credentialQueryParams {
-		if _, ok := query[name]; ok {
-			query.Set(name, "redacted")
-			redacted = true
+	for name := range query {
+		for _, credential := range credentialQueryParams {
+			if strings.ToLower(name) == credential {
+				query.Set(name, "redacted")
+				redacted = true
+			}
 		}
 	}
 	if !redacted {
@@ -247,14 +264,8 @@ func main() {
 		stripe.Key = cfg.StripeSecretKey
 	}
 
-	webhookHTTPTimeout, err := time.ParseDuration(cfg.WebhookHTTPTimeout)
-	if err != nil {
-		webhookHTTPTimeout = 10 * time.Second
-	}
-	webhookRetryInterval, err := time.ParseDuration(cfg.WebhookRetryInterval)
-	if err != nil {
-		webhookRetryInterval = 30 * time.Second
-	}
+	webhookHTTPTimeout := positiveDuration(cfg.WebhookHTTPTimeout, 10*time.Second)
+	webhookRetryInterval := positiveDuration(cfg.WebhookRetryInterval, 30*time.Second)
 
 	bf := middleware.NewBruteForceProtection(
 		cfg.BFMaxFails,
@@ -564,17 +575,24 @@ func main() {
 		}()
 	}
 
+	// Yesterday's analytics snapshot, taken at start and checked for every
+	// hour, so a server restarted more than once a day still takes one
+	// (see store.TakeMissingSnapshots).
 	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
+		snapshot := func() {
+			if err := db.TakeMissingSnapshots(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
+				logger.Error("analytics snapshot failed", "error", err)
+			}
+		}
+		snapshot()
+		ticker := time.NewTicker(time.Hour)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := db.TakeAllSnapshots(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
-					logger.Error("analytics snapshot failed", "error", err)
-				}
+				snapshot()
 			}
 		}
 	}()
@@ -656,6 +674,13 @@ func main() {
 		}
 		c.Next()
 	})
+
+	// After the attribution, security and CORS headers, so a body refused
+	// as too large is answered with them like any other response (AGPL v3
+	// Section 7b: X-Powered-By on every API response), and a browser can
+	// read the refusal. None of those read the body; every handler comes
+	// after this.
+	r.Use(middleware.BodyLimit(middleware.MaxRequestBody))
 
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
@@ -1269,9 +1294,16 @@ func main() {
 		response.NotFound(c, "no such endpoint")
 	})
 
+	// A client that sends its headers or body a byte at a time holds a
+	// connection, and its goroutine, until it is done; these bound how
+	// long that can be. No write timeout: an export or a slow download
+	// may take longer to send than any fixed limit.
 	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
@@ -1300,6 +1332,19 @@ func main() {
 }
 
 var htmlTagPattern = regexp.MustCompile(`(?i)<[/!]?[a-z][^<>]*>|<!--[\s\S]*?-->`)
+
+// positiveDuration parses a duration setting, falling back to def when
+// it does not parse or is not above zero. Zero is not "no limit" for the
+// webhook settings: a zero HTTP timeout leaves a send unbounded past the
+// lease that holds its delivery, so another replica sends it again, and
+// a zero retry interval makes the retry ticker panic.
+func positiveDuration(s string, def time.Duration) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
 
 // profileName is the name a profile update stores: trimmed, at most 100
 // characters, with HTML tags stripped. ok is false when it is longer.

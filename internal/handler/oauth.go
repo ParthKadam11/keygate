@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/service"
 	"github.com/tabloy/keygate/internal/store"
+	"github.com/tabloy/keygate/pkg/apperr"
 	"github.com/tabloy/keygate/pkg/response"
 )
 
@@ -194,24 +196,61 @@ func hashToken(raw string) string {
 }
 
 func (h *AuthHandler) Providers(c *gin.Context) {
-	devLogin := h.Config.IsDevLoginAllowed()
-	response.OK(c, gin.H{"dev_login": devLogin, "otp": true})
+	response.OK(c, gin.H{"dev_login": h.devLoginOpen(c), "otp": true})
 }
 
-// DevLogin is a development-only endpoint that creates a session without email OTP.
-// Security: This endpoint is ONLY available when BOTH conditions are met:
-//  1. ENVIRONMENT is explicitly set to "development"
-//  2. The server is NOT listening on a public interface (checked via BASE_URL)
+// devLoginOpen reports whether this request may use dev-login: the
+// server allows it (ENVIRONMENT=development, BASE_URL on this machine;
+// see Config.IsDevLoginAllowed), and the request comes from this
+// machine. ENVIRONMENT defaults to development, so a server started
+// with no configuration and reachable from elsewhere would otherwise
+// hand an owner session to anyone who asked.
 //
-// This prevents accidental exposure in production deployments.
-func (h *AuthHandler) DevLogin(c *gin.Context) {
+// From this machine means: the TCP peer is loopback, the request names
+// this machine as its host, and it carries no forwarding header. A
+// reverse proxy on the same machine makes every visitor's peer
+// loopback, but it passes on the public host name or says whom it
+// forwards for; the Vite dev proxy does neither (it rewrites Host to
+// the target and adds no X-Forwarded-For).
+func (h *AuthHandler) devLoginOpen(c *gin.Context) bool {
 	if !h.Config.IsDevLoginAllowed() {
-		response.NotFound(c, "not found")
-		return
+		return false
 	}
-	// Block dev-login on public-facing hosts
-	base := h.Config.BaseURL
-	if !strings.Contains(base, "localhost") && !strings.Contains(base, "127.0.0.1") {
+	for _, name := range []string{"X-Forwarded-For", "X-Forwarded-Host", "Forwarded", "X-Real-IP"} {
+		if c.Request.Header.Get(name) != "" {
+			return false
+		}
+	}
+	peer, _, err := net.SplitHostPort(c.Request.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	if ip := net.ParseIP(peer); ip == nil || !ip.IsLoopback() {
+		return false
+	}
+	return isLoopbackHost(c.Request.Host)
+}
+
+// isLoopbackHost reports whether a Host header, with or without a
+// port, names this machine.
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// DevLogin is a development-only endpoint that creates a session without
+// email OTP, for a caller on the machine running a development server
+// (see devLoginOpen). Anywhere else it does not exist.
+func (h *AuthHandler) DevLogin(c *gin.Context) {
+	if !h.devLoginOpen(c) {
 		response.NotFound(c, "not found")
 		return
 	}
@@ -229,6 +268,11 @@ func (h *AuthHandler) DevLogin(c *gin.Context) {
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	if req.Name == "" {
 		req.Name = "Dev User"
+	}
+	// The name rides in the session token, as in setup.
+	if err := apperr.ValidateName("name", req.Name); err != nil {
+		response.BadRequest(c, err.Message)
+		return
 	}
 
 	user := &model.User{Email: req.Email, Name: req.Name}

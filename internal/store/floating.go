@@ -4,10 +4,31 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"time"
+
+	"github.com/uptrace/bun"
 
 	"github.com/tabloy/keygate/internal/model"
 )
+
+// stoppedStatuses are the statuses whose licence holds no floating
+// session: one cannot be checked out or kept alive under them, and one
+// left from before would come back with the licence (a reinstate, a
+// Stripe resume), counted towards the cap and heartbeating without a
+// new checkout. Canceled is not among them: a canceled licence works to
+// the end of the period it paid for.
+var stoppedStatuses = []string{model.StatusSuspended, model.StatusExpired, model.StatusRevoked}
+
+// endFloatingSessionsIfStoppedIn ends the licence's floating sessions
+// when status is one of stoppedStatuses, in the write that gives it.
+func endFloatingSessionsIfStoppedIn(ctx context.Context, db bun.IDB, licenseID, status string) error {
+	if !slices.Contains(stoppedStatuses, status) {
+		return nil
+	}
+	_, err := db.NewDelete().Model((*model.FloatingSession)(nil)).Where("license_id = ?", licenseID).Exec(ctx)
+	return err
+}
 
 // ErrFloatingLimitReached is returned when all floating sessions are in use.
 var ErrFloatingLimitReached = errors.New("floating session limit reached")
@@ -241,9 +262,13 @@ func (s *Store) ListFloatingSessions(ctx context.Context, licenseID string, p Pa
 	return out, total, nil
 }
 
+// CleanExpiredFloating removes floating sessions past their lease, and
+// any a licence that stopped still holds (see stoppedStatuses): the
+// writes that stop a licence end its sessions, and this catches one
+// that did not.
 func (s *Store) CleanExpiredFloating(ctx context.Context) (int, error) {
 	res, err := s.DB.NewDelete().Model((*model.FloatingSession)(nil)).
-		Where("expires_at <= now()").Exec(ctx)
+		Where("expires_at <= now() OR license_id IN (SELECT id FROM licenses WHERE status IN (?))", bun.In(stoppedStatuses)).Exec(ctx)
 	if err != nil {
 		return 0, err
 	}

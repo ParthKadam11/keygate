@@ -20,10 +20,26 @@ func TestIsDevLoginAllowed(t *testing.T) {
 		{"dev", false},
 	}
 	for _, tt := range tests {
-		c := &Config{Environment: tt.env}
+		c := &Config{Environment: tt.env, BaseURL: "http://localhost:9000"}
 		got := c.IsDevLoginAllowed()
 		if got != tt.want {
 			t.Errorf("IsDevLoginAllowed(%q) = %v, want %v", tt.env, got, tt.want)
+		}
+	}
+	// Only with a BASE_URL on this machine, its host parsed.
+	for base, want := range map[string]bool{
+		"http://localhost:9000":                   true,
+		"http://127.0.0.1:9000":                   true,
+		"http://[::1]:9000":                       true,
+		"http://app.localhost:5173":               true,
+		"https://licensing.example.com":           false,
+		"https://localhost.licensing.example.com": false,
+		"https://example.com/localhost":           false,
+		"http://127.0.0.1.example.com":            false,
+	} {
+		c := &Config{Environment: "development", BaseURL: base}
+		if got := c.IsDevLoginAllowed(); got != want {
+			t.Errorf("IsDevLoginAllowed with BASE_URL %q = %v, want %v", base, got, want)
 		}
 	}
 }
@@ -72,6 +88,7 @@ func TestValidateSecurityDefaults(t *testing.T) {
 	t.Run("valid dev config", func(t *testing.T) {
 		c := &Config{
 			Environment: "development",
+			BaseURL:     "http://localhost:9000",
 			JWTSecret:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			// 32-byte ed25519 seed in hex (64 chars).
 			LicenseSigningKey: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

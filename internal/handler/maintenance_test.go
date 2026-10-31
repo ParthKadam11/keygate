@@ -1094,7 +1094,7 @@ func TestRestoringFeedsSeesAPlanCreatedMeanwhile(t *testing.T) {
 	// A saas product that published releases while it still served
 	// feeds, gated a moment ago.
 	now := time.Now()
-	prod := &model.Product{Name: "Late", Slug: "late-" + suffix, Type: "saas", FeedLicenseRequired: true, FeedGatedAt: &now}
+	prod := &model.Product{Name: "Late", Slug: "late-" + suffix, Type: "desktop", FeedLicenseRequired: true, FeedGatedAt: &now}
 	if err := s.CreateProduct(ctx, prod); err != nil {
 		t.Fatal(err)
 	}
@@ -1103,6 +1103,10 @@ func TestRestoringFeedsSeesAPlanCreatedMeanwhile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB.NewRaw("UPDATE releases SET status = 'published', published_at = now() WHERE id = ?", rel.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Its releases were published while it was a desktop product.
+	if _, err := s.DB.NewRaw("UPDATE products SET type = 'saas' WHERE id = ?", prod.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
 	h := &AdminHandler{Store: s, FeedURLTTL: time.Hour}

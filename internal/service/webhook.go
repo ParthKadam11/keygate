@@ -433,6 +433,11 @@ func numericHost(host string) bool {
 }
 
 func (s *WebhookService) Dispatch(ctx context.Context, productID, event string, data map[string]any) {
+	// No webhook service (a test, a tool built without one): nothing to
+	// send, as EmailService does with no mailer.
+	if s == nil {
+		return
+	}
 	if err := s.DispatchWithLog(ctx, productID, event, data); err != nil {
 		s.logger.Error("webhook dispatch failed", "event", event, "product_id", productID, "error", err)
 	}
@@ -460,6 +465,9 @@ func (s *WebhookService) inflightHoldOff() *time.Time {
 // DispatchWithLog dispatches webhook events and returns any error that occurs during setup.
 // Use this when the caller needs to handle or log dispatch failures explicitly.
 func (s *WebhookService) DispatchWithLog(ctx context.Context, productID, event string, data map[string]any) error {
+	if s == nil {
+		return nil
+	}
 	webhooks, err := s.store.FindWebhooksForEvent(ctx, productID, event)
 	if err != nil {
 		return fmt.Errorf("find webhooks: %w", err)

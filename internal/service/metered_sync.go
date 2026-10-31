@@ -97,45 +97,94 @@ func stripeMeterEventDispatch(ctx context.Context, in stripeMeterEvent) (string,
 	return ev.Identifier, nil
 }
 
-// RunOnce drains up to `limit` pending events. Returns the number
+// meteredFailuresEndPass is how many pushes failing in a row end a sync
+// pass (see TryRunOnce).
+const meteredFailuresEndPass = 10
+
+// RunOnce drains every pending event, `limit` at a time. Returns the number
 // of rows that were actually pushed to Stripe (excludes sentinel-
 // drained rows like missing customer / cleared event_name / legacy
 // no-identifier). Errors are logged + recorded per-row, never
 // propagated — a poison-pill row should not block the rest of the
 // queue.
+//
+// One pass runs at a time across replicas (see store.TryMeteredSyncLock):
+// a pass that finds another running returns 0 and leaves the rows to it.
 func (m *MeteredBillingSyncer) RunOnce(ctx context.Context, limit int) (pushed int) {
+	pushed, _, _ = m.TryRunOnce(ctx, limit)
+	return pushed
+}
+
+// TryRunOnce is RunOnce, and says whether the pass ran: ran is false
+// when another pass held the lock. err is the lock not being taken at
+// all (the database unreachable, say), which is not another pass.
+func (m *MeteredBillingSyncer) TryRunOnce(ctx context.Context, limit int) (pushed int, ran bool, err error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := m.store.ListUnsyncedMetered(ctx, limit, m.maxAttempts)
+	release, ok, err := m.store.TryMeteredSyncLock(ctx)
 	if err != nil {
-		m.logger.Error("metered: list unsynced failed", "error", err)
-		return 0
+		m.logger.Error("metered: sync lock failed", "error", err)
+		return 0, false, err
 	}
-	for _, row := range rows {
-		if row.Attempts >= m.maxAttempts {
-			// Hit the ceiling. Don't keep retrying forever; admin
-			// inspection required. Skip silently — the row's
-			// last_error already records the situation.
-			continue
-		}
-		sent, err := m.syncOne(ctx, row)
+	if !ok {
+		m.logger.Debug("metered: another replica is syncing; skipping this pass")
+		return 0, false, nil
+	}
+	defer release()
+	ran = true
+	// The whole queue, limit rows at a time: one batch a pass let a
+	// product recording more than a batch an interval fall behind for
+	// good, and usage that reaches Stripe after its invoice is finalized
+	// is never billed. Each row is tried once a pass (see
+	// ListUnsyncedMeteredAfter); one that failed waits for the next.
+	//
+	// A run of failures in a row ends the pass: Stripe unreachable makes
+	// every push fail slowly (the client's own retries), and a pass that
+	// went on through a backlog of thousands would hold the lock, and an
+	// admin's request, for hours. What is left goes with the next pass.
+	var last *model.MeteredBilling
+	failedInARow := 0
+	for ctx.Err() == nil && failedInARow < meteredFailuresEndPass {
+		rows, err := m.store.ListUnsyncedMeteredAfter(ctx, last, limit, m.maxAttempts)
 		if err != nil {
-			m.logger.Warn("metered: push failed",
-				"id", row.ID, "license_id", row.LicenseID,
-				"feature", row.Feature, "attempts", row.Attempts+1,
-				"error", err)
-			// Single source of attempts bump on failure. syncOne
-			// does NOT touch attempts; RecordMeteredSyncFailure
-			// owns it. Without this split the counter doubled.
-			_ = m.store.RecordMeteredSyncFailure(ctx, row.ID, err.Error())
-			continue
+			m.logger.Error("metered: list unsynced failed", "error", err)
+			return pushed, true, err
 		}
-		if sent {
-			pushed++
+		for _, row := range rows {
+			if row.Attempts >= m.maxAttempts {
+				// Hit the ceiling. Don't keep retrying forever; admin
+				// inspection required. Skip silently — the row's
+				// last_error already records the situation.
+				continue
+			}
+			sent, err := m.syncOne(ctx, row)
+			if err != nil {
+				m.logger.Warn("metered: push failed",
+					"id", row.ID, "license_id", row.LicenseID,
+					"feature", row.Feature, "attempts", row.Attempts+1,
+					"error", err)
+				// Single source of attempts bump on failure. syncOne
+				// does NOT touch attempts; RecordMeteredSyncFailure
+				// owns it. Without this split the counter doubled.
+				_ = m.store.RecordMeteredSyncFailure(ctx, row.ID, err.Error())
+				if failedInARow++; failedInARow >= meteredFailuresEndPass {
+					m.logger.Warn("metered: pushes keep failing; ending this pass", "failed_in_a_row", failedInARow)
+					break
+				}
+				continue
+			}
+			failedInARow = 0
+			if sent {
+				pushed++
+			}
 		}
+		if len(rows) < limit {
+			break
+		}
+		last = rows[len(rows)-1]
 	}
-	return pushed
+	return pushed, true, nil
 }
 
 // syncOne pushes a single event. Returns (sent, err):

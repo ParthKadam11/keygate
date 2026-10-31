@@ -165,7 +165,7 @@ func RenderSparkle(in FeedInput) ([]byte, error) {
 			SparkleVersion:  rel.Version,
 			SparkleShortVer: rel.Version,
 			Description: sparkleDescription{
-				Body: sanitizeCDATA(rel.ReleaseNotes),
+				Body: xmlText(rel.ReleaseNotes),
 			},
 			CriticalUpdate: critical,
 			Enclosure: sparkleEnclosure{
@@ -185,15 +185,23 @@ func RenderSparkle(in FeedInput) ([]byte, error) {
 	return append([]byte(xml.Header), body...), nil
 }
 
-// sanitizeCDATA splits any literal "]]>" sequences across CDATA sections so
-// admin-provided release notes can't accidentally (or maliciously) terminate
-// the CDATA section early.
-//
-// The split trick: replace ]]> with ]]]]><![CDATA[> — the first ]] terminates
-// the current CDATA, the next ]]> is split between two CDATA sections, and
-// parsing resumes correctly.
-func sanitizeCDATA(s string) string {
-	return strings.ReplaceAll(s, "]]>", "]]]]><![CDATA[>")
+// xmlText drops what XML 1.0 cannot carry, even in CDATA: control
+// characters other than tab, newline and carriage return (an ANSI colour
+// code pasted from a CI changelog, say), and invalid UTF-8. One such
+// character would make the whole appcast unparseable, every release in
+// it with it. A literal "]]>" needs nothing here: encoding/xml splits it
+// across CDATA sections itself.
+func xmlText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t', r == '\n', r == '\r',
+			r >= 0x20 && r <= 0xD7FF,
+			r >= 0xE000 && r <= 0xFFFD,
+			r >= 0x10000 && r <= 0x10FFFF:
+			return r
+		}
+		return -1
+	}, strings.ToValidUTF8(s, ""))
 }
 
 // ─── Velopack (releases.{channel}.json) ───

@@ -838,7 +838,7 @@ export default function AnalyticsPage() {
                             {(() => {
                               const maxUserUsage = Math.max(...insights.top_users.map((u) => u.total_usage), 1)
                               return insights.top_users.map((u, i) => (
-                                <DataTableRow key={u.user_id}>
+                                <DataTableRow key={u.email}>
                                   <DataTableCell className="font-medium text-muted-foreground">{i + 1}</DataTableCell>
                                   <DataTableCell className="font-medium">{u.email}</DataTableCell>
                                   <DataTableCell>{u.license_count}</DataTableCell>

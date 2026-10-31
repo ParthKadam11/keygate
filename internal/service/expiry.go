@@ -120,8 +120,9 @@ func (c *ExpiryChecker) ExpireGracePeriodLicenses(ctx context.Context) {
 		}
 		grace := time.Duration(graceDays) * 24 * time.Hour
 		if time.Now().After(lic.ValidUntil.Add(grace)) {
-			// Re-checked in the write itself: an admin may have
-			// extended or reinstated the licence since it was read.
+			// Re-checked in the write itself, against the plan as it
+			// is then: an admin may have extended or reinstated the
+			// licence, or given it more grace, since it was read.
 			cutoff := time.Now().Add(-grace)
 			if c.EndGraceExpiredUpgrade != nil {
 				handled, err := c.EndGraceExpiredUpgrade(ctx, lic, cutoff)
@@ -133,8 +134,7 @@ func (c *ExpiryChecker) ExpireGracePeriodLicenses(ctx context.Context) {
 					continue
 				}
 			}
-			ok, err := c.store.ExpireLicenseIf(ctx, lic.ID,
-				[]string{model.StatusActive, model.StatusPastDue}, &cutoff)
+			ok, err := c.store.ExpireLicenseAfterGrace(ctx, lic.ID)
 			if err != nil {
 				c.logger.Error("expire license failed", "id", lic.ID, "error", err)
 				continue

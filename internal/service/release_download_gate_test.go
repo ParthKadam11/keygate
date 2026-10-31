@@ -353,4 +353,24 @@ func TestFeedCutoffForToken_PausedMemberSeat(t *testing.T) {
 	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "a-pc"); !notFound(err) {
 		t.Fatalf("removed member token feed = %v, want LICENSE_NOT_FOUND", err)
 	}
+
+	// A product that no longer has seats opens no member's key, so a
+	// member's device token stops too; the owner's device goes on.
+	if err := s.ActivateForKey(ctx, &model.Activation{
+		LicenseID: lic.ID, Identifier: "owner-pc", IdentifierType: "device",
+	}, 10, lic.LicenseKey); err != nil {
+		t.Fatalf("activate owner-pc again: %v", err)
+	}
+	if _, err := s.DB.NewRaw("UPDATE products SET type = 'desktop' WHERE id = ?", prod.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.FeedCutoff(ctx, keys[1], prod.ID); !notFound(err) {
+		t.Fatalf("member key feed once the product has no seats = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "b-pc"); !notFound(err) {
+		t.Fatalf("member token feed once the product has no seats = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := svc.FeedCutoffForToken(ctx, lic.ID, prod.ID, "owner-pc"); err != nil {
+		t.Fatalf("owner device token feed once the product has no seats: %v", err)
+	}
 }

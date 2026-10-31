@@ -226,7 +226,7 @@ function LicenseCard({ license: lic, renewalsEnabled }: { license: PortalLicense
           </div>
           <div>
             <p className="text-muted-foreground">{t("licenses.validUntil")}</p>
-            <p className="font-medium">{formatDate(lic.valid_until)}</p>
+            <p className="font-medium">{lic.valid_until ? formatDate(lic.valid_until) : t("licenses.perpetual")}</p>
           </div>
           {/* The count and cap are the team's: a member is told so, as
               the list below holds only their own devices. */}
@@ -701,11 +701,13 @@ function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSe
       showToast(
         errorCode(e) === "UPGRADE_IN_PROGRESS"
           ? t("portal.inviteDuringUpgrade")
-          : errorCode(e) === "SEAT_LIMIT"
-            ? t("portal.inviteSeatLimit")
-            : changedElsewhere(e)
-              ? t("portal.changedElsewhere")
-              : e.message,
+          : errorCode(e) === "UPGRADE_SEAT_LIMIT"
+            ? t("portal.inviteUpgradeSeatLimit")
+            : errorCode(e) === "SEAT_LIMIT"
+              ? t("portal.inviteSeatLimit")
+              : changedElsewhere(e)
+                ? t("portal.changedElsewhere")
+                : e.message,
         "error",
       )
     },
@@ -977,18 +979,22 @@ function InviteSeatDialog({ license, onClose }: { license: PortalLicense; onClos
       // Full, or no longer taking members (its state or key changed
       // since the page loaded): the card behind is read again, so it
       // shows the license as it is.
-      if (errorCode(e) === "SEAT_LIMIT" || errorCode(e) === "LICENSE_NOT_FOUND")
+      if (["SEAT_LIMIT", "UPGRADE_SEAT_LIMIT", "LICENSE_NOT_FOUND"].includes(errorCode(e) ?? "")) {
         qc.invalidateQueries({ queryKey: ["portal", "licenses"] })
+        qc.invalidateQueries({ queryKey: ["portal", "seats", license.id] })
+      }
       // Nothing to retry: the dialog goes, and the card shows why.
       if (errorCode(e) === "LICENSE_NOT_FOUND") onClose()
       showToast(
         errorCode(e) === "UPGRADE_IN_PROGRESS"
           ? t("portal.inviteDuringUpgrade")
-          : errorCode(e) === "SEAT_LIMIT"
-            ? t("portal.inviteSeatLimit")
-            : errorCode(e) === "LICENSE_NOT_FOUND"
-              ? t("portal.changedElsewhere")
-              : e.message,
+          : errorCode(e) === "UPGRADE_SEAT_LIMIT"
+            ? t("portal.inviteUpgradeSeatLimit")
+            : errorCode(e) === "SEAT_LIMIT"
+              ? t("portal.inviteSeatLimit")
+              : errorCode(e) === "LICENSE_NOT_FOUND"
+                ? t("portal.changedElsewhere")
+                : e.message,
         "error",
       )
     },

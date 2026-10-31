@@ -772,6 +772,8 @@ const en = {
   "portal.planInactive": "This plan is no longer available. Choose another one.",
   "portal.inviteDuringUpgrade":
     "An upgrade checkout for this license was opened in the last hour. Invites work again once it is paid, or once it lapses within the hour.",
+  "portal.inviteUpgradeSeatLimit":
+    "An upgrade checkout for this license is open, and the plan it upgrades to has no seat left for another person.",
   "portal.inviteSeatLimit": "All seats on this license are taken, so nobody else can be invited right now.",
   "portal.downgradeNotSupported":
     "This change lowers one limit while raising another, costs more, or bills on a different schedule, so it can't be made here. Please contact the seller.",
@@ -962,6 +964,12 @@ const en = {
   // Licenses refund
   "licenses.refund": "Cancel and revoke",
   "licenses.updatesUntil": "Updates Until",
+  "licenses.maintenanceDisabled":
+    "Maintenance-period features are switched off. Enable them in Settings once every server runs this version.",
+  "licenses.reinstatedLapsed":
+    "Reinstated, but its expiry date passed while it was suspended, so it still does not work. Set a new expiry date to keep it.",
+  "licenses.reinstatedLapsedStripe":
+    "Reinstated, but its expiry date passed while it was suspended, so it does not work until its Stripe subscription is paid.",
   "licenses.updatesUntilEdit": "Edit update period",
   "licenses.updatesUntilClear": "Leave empty for lifetime updates.",
 

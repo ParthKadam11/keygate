@@ -638,6 +638,31 @@ func TestEndGraceExpiredUpgrade(t *testing.T) {
 	f.assertBackOnFree(t, sessionID, upgradeEndGrace)
 }
 
+// The sweep's cutoff is from the plan as it read it. Grace raised on the
+// paid plan since then keeps the licence on it: judged by the plan as it
+// is now, it is within its grace.
+func TestEndGraceExpiredUpgrade_GraceRaisedSinceRead(t *testing.T) {
+	f := newUpgradeFixture(t, "upraised")
+	sessionID, subID := "cs_ra_"+f.tag, "sub_ra_"+f.tag
+	f.applySub(t, sessionID, subID)
+	l := f.reload(t)
+	lapsed := time.Now().Add(-10 * 24 * time.Hour)
+	l.ValidUntil = &lapsed
+	if err := f.s.UpdateLicense(f.ctx, l, "valid_until"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET grace_days = 30 WHERE id = ?", f.paid.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	handled, err := f.h.EndGraceExpiredUpgrade(f.ctx, l, time.Now().Add(-7*24*time.Hour))
+	if err != nil || !handled {
+		t.Fatalf("handled=%v err=%v, want left alone this round", handled, err)
+	}
+	if got := f.reload(t); got.PlanID != f.paid.ID {
+		t.Fatalf("plan = %s, want still the paid plan", got.PlanID)
+	}
+}
+
 // Stripe still has the subscription active: only the local period is
 // stale. The grace hook syncs it and keeps the licence, rather than
 // expiring or reverting a customer who is paying.

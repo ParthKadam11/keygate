@@ -652,7 +652,7 @@ func TestUpgrade_PerSeat(t *testing.T) {
 		t.Fatalf("upgrade checkout = %v, want 3 seats, adjustable", s)
 	}
 	// Invites wait while it is open, so an abandoned one lapses soon.
-	if exp, _ := strconv.ParseInt(sessions[0]["expires_at"], 10, 64); exp == 0 || time.Until(time.Unix(exp, 0)) > store.PerSeatUpgradeCheckoutTTL+time.Minute {
+	if exp, _ := strconv.ParseInt(sessions[0]["expires_at"], 10, 64); exp == 0 || time.Until(time.Unix(exp, 0)) > store.UpgradeCheckoutTTL+time.Minute {
 		t.Fatalf("upgrade checkout expires_at = %q, want within the hour", sessions[0]["expires_at"])
 	}
 
@@ -1120,12 +1120,15 @@ func TestUpgrade_TeamLargerThanMaxSeats(t *testing.T) {
 	if _, err := f.s.DB.NewRaw("UPDATE plans SET max_seats = 2 WHERE id = ?", f.paid.ID).Exec(f.ctx); err != nil {
 		t.Fatal(err)
 	}
+	var expiresAt string
 	sub := newFakeSubscription("sub_unused_"+f.tag, f.paid.StripePriceID, 1, nil)
 	sub.extra = func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/v1/prices/"):
 			fmt.Fprintf(w, `{"id":%q,"object":"price","type":"recurring","active":true}`, f.paid.StripePriceID)
 		case r.URL.Path == "/v1/checkout/sessions":
+			_ = r.ParseForm()
+			expiresAt = r.PostForm.Get("expires_at")
 			fmt.Fprintf(w, `{"id":"cs_upmax_%s","object":"checkout.session","url":"https://checkout.stripe.test/x"}`, f.tag)
 		default:
 			return false
@@ -1163,6 +1166,16 @@ func TestUpgrade_TeamLargerThanMaxSeats(t *testing.T) {
 	}
 	if code, out := start(); code != http.StatusOK {
 		t.Fatalf("upgrade of 2 people to a plan of 2 seats = %d %v, want a checkout", code, out)
+	}
+	// While it is open the team stays within the 2 seats it was checked
+	// against, so the checkout lapses with that hold, not Stripe's day.
+	if exp, _ := strconv.ParseInt(expiresAt, 10, 64); exp == 0 || time.Until(time.Unix(exp, 0)) > store.UpgradeCheckoutTTL+time.Minute {
+		t.Fatalf("upgrade checkout expires_at = %q, want within the hour", expiresAt)
+	}
+	_, hash := store.GenerateSeatInviteToken()
+	_, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: "m9-" + f.lic.Email, Role: "member", InviteTokenHash: hash}, 0)
+	if !errors.Is(err, store.ErrUpgradeSeatLimit) {
+		t.Fatalf("a 3rd person while the checkout for 2 seats is open = %v, want ErrUpgradeSeatLimit", err)
 	}
 }
 
@@ -2725,6 +2738,56 @@ func TestUpgrade_NoInvitesWhileTheCheckoutIsOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := invite("after"); err != nil {
+		t.Fatalf("invite once the checkout can no longer be paid: %v", err)
+	}
+}
+
+// While a checkout for upgrading to a plan with a seat limit, not sold
+// per seat, is open, the team grows only as far as that limit: it was
+// checked against it when the checkout opened, and paying applies the
+// plan regardless. A plan with no limit holds nothing up.
+func TestUpgrade_InvitesHeldToTheTargetsSeatLimit(t *testing.T) {
+	f := newUpgradeFixture(t, "upcap")
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET per_seat = false, max_seats = 3 WHERE id = ?", f.paid.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET max_seats = 10 WHERE id = ?", f.free.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	invite := func(email string) error {
+		_, hash := store.GenerateSeatInviteToken()
+		_, _, err := f.s.AddSeatWithinLimit(f.ctx, &model.Seat{LicenseID: f.lic.ID, Email: email + "-" + f.lic.Email, Role: "member", InviteTokenHash: hash}, 10)
+		return err
+	}
+	u := &model.LicenseUpgrade{LicenseID: f.lic.ID, ToPlanID: f.paid.ID, StripeCheckoutSessionID: "cs_cap_" + f.tag}
+	if err := store.CreateLicenseUpgradeIn(f.ctx, f.s.DB, u); err != nil {
+		t.Fatal(err)
+	}
+	// The owner and two members fill the 3 seats of the plan paid for.
+	for _, who := range []string{"a", "b"} {
+		if err := invite(who); err != nil {
+			t.Fatalf("invite %s within the plan's 3 seats: %v", who, err)
+		}
+	}
+	if err := invite("c"); !errors.Is(err, store.ErrUpgradeSeatLimit) {
+		t.Fatalf("a 4th person while the checkout for 3 seats is open = %v, want ErrUpgradeSeatLimit", err)
+	}
+	if err := invite("a"); err != nil {
+		t.Fatalf("the same invite sent again while the checkout is open: %v", err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET max_seats = 0 WHERE id = ?", f.paid.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := invite("c"); err != nil {
+		t.Fatalf("invite while a checkout for a plan with no seat limit is open: %v", err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET max_seats = 3 WHERE id = ?", f.paid.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE license_upgrades SET created_at = now() - interval '25 hours' WHERE id = ?", u.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := invite("d"); err != nil {
 		t.Fatalf("invite once the checkout can no longer be paid: %v", err)
 	}
 }

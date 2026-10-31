@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/mod/semver"
 )
@@ -59,7 +60,9 @@ func ValidateName(field, value string) *AppError {
 	if value == "" {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: field + " is required"}
 	}
-	if len(value) > 200 {
+	// Characters, as the message says, not bytes: 200 of them is at
+	// most 800 bytes, which a session token carrying a name still fits.
+	if utf8.RuneCountInString(value) > 200 {
 		return &AppError{Status: 400, Code: "INVALID_INPUT", Message: field + " must be at most 200 characters"}
 	}
 	return nil

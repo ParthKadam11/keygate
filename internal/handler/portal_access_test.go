@@ -253,6 +253,12 @@ func TestPortalGuards(t *testing.T) {
 		{"removed member", p.gone.Email, withKey(lic.LicenseKey), http.StatusNotFound},
 		{"stranger", "stranger@example.com", withKey(lic.LicenseKey), http.StatusNotFound},
 		{"no key: the handler answers", p.pending.Email, `{}`, passed},
+		{"no body: the handler answers", p.pending.Email, ``, passed},
+		// The handler reads the first JSON value and ignores what
+		// follows, so the guard checks that key too.
+		{"stranger, bytes after the body", "stranger@example.com", withKey(lic.LicenseKey) + ` x`, http.StatusNotFound},
+		{"stranger, a second value after it", "stranger@example.com", withKey(lic.LicenseKey) + `{}`, http.StatusNotFound},
+		{"a body that does not parse", "stranger@example.com", `{"license_key":`, http.StatusBadRequest},
 		{"no session email", "", withKey(lic.LicenseKey), http.StatusUnauthorized},
 		{"body too large", lic.Email, `{"license_key":"` + strings.Repeat("x", portalGuardMaxBody) + `"}`, http.StatusRequestEntityTooLarge},
 	} {

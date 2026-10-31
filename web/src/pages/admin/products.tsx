@@ -59,7 +59,7 @@ export default function ProductsPage() {
   const createMut = useMutation({
     mutationFn: admin.createProduct,
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "products"] })
+      qc.invalidateQueries({ queryKey: ["admin"] })
       setCreating(false)
       showToast(t("toast.productCreated"), "success")
     },
@@ -68,7 +68,9 @@ export default function ProductsPage() {
   const updateMut = useMutation({
     mutationFn: ({ id, ...data }: Partial<Product> & { id: string }) => admin.updateProduct(id, data),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "products"] })
+      // Its type decides what its plans and licences show (seats or
+      // not), and they embed it: read them again too.
+      qc.invalidateQueries({ queryKey: ["admin"] })
       setEditing(null)
     },
     onError: (e: Error) => showToast(e.message, "error"),
@@ -76,7 +78,7 @@ export default function ProductsPage() {
   const deleteMut = useMutation({
     mutationFn: (id: string) => admin.deleteProduct(id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "products"] })
+      qc.invalidateQueries({ queryKey: ["admin"] })
       setDeleting(null)
       showToast(t("toast.productDeleted"), "success")
     },

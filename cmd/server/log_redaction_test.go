@@ -27,6 +27,11 @@ func TestRedactPath(t *testing.T) {
 		{"/f?license_token=abc.def", "/f?license_token=redacted"},
 		{"/f?license_key=a&license_key=b", "/f?license_key=redacted"},
 		{"/f?%zz", "/f?<redacted>"},
+		// The invite link's claim token, and a credential named in
+		// another case.
+		{"/accept-invite?token=abc123", "/accept-invite?token=redacted"},
+		{"/f?LICENSE_KEY=KG-SECRET", "/f?LICENSE_KEY=redacted"},
+		{"/f?License_Token=abc.def", "/f?License_Token=redacted"},
 
 		// The customer portal addresses a licence by its key, so the
 		// credential is a path segment rather than a parameter and
@@ -53,6 +58,14 @@ func TestRedactPath(t *testing.T) {
 		},
 		// A route that only looks similar keeps its path.
 		{"/api/v1/admin/licenses/abc123/key", "/api/v1/admin/licenses/abc123/key"},
+		// Shapes the router does not match still reach the access log.
+		{"/api/v1/Portal/licenses/KG-SECRET/activations", "/api/v1/portal/licenses/redacted"},
+		{"/api/v1//portal/licenses/KG-SECRET/activations", "/api/v1/portal/licenses/redacted"},
+		{"/api/v1/portal/./licenses/KG-SECRET", "/api/v1/portal/licenses/redacted"},
+		{"/API/V1/PORTAL/LICENSES/KG-SECRET?x=1", "/api/v1/portal/licenses/redacted?x=1"},
+		{"/portal/licenses/KG-SECRET/activations", "/portal/licenses/redacted/activations"},
+		{"//Portal/licenses/KG-SECRET", "/portal/licenses/redacted"},
+		{"/portal/licenses", "/portal/licenses"},
 	}
 	for _, c := range cases {
 		if got := redactPath(c.in); got != c.want {

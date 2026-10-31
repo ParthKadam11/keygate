@@ -45,6 +45,9 @@ func (h *ReleaseSigningAdminHandler) Generate(c *gin.Context) {
 		case errors.Is(err, store.ErrSigningKeyAlreadyActive):
 			response.Err(c, http.StatusConflict, "KEY_ALREADY_ACTIVE",
 				"this product already has an active signing key — rotate instead")
+		case store.IsForeignKeyViolation(err):
+			// The product was deleted after it was checked.
+			response.NotFound(c, "product not found")
 		default:
 			response.Internal(c, err)
 		}
@@ -86,6 +89,14 @@ func (h *ReleaseSigningAdminHandler) Rotate(c *gin.Context) {
 		switch {
 		case errors.Is(err, service.ErrSigningDisabled):
 			response.Err(c, http.StatusServiceUnavailable, "SIGNING_DISABLED", service.ErrSigningDisabled.Error())
+		case errors.Is(err, store.ErrSigningKeyAlreadyActive):
+			// Another key was made active meanwhile; rotating again
+			// replaces it.
+			response.Err(c, http.StatusConflict, "KEY_ALREADY_ACTIVE",
+				"another signing key was made active meanwhile; rotate again to replace it")
+		case store.IsForeignKeyViolation(err):
+			// The product was deleted after it was checked.
+			response.NotFound(c, "product not found")
 		default:
 			response.Internal(c, err)
 		}
@@ -211,6 +222,11 @@ func (h *ReleaseSigningAdminHandler) Deactivate(c *gin.Context) {
 	}
 
 	if err := h.store.DeactivateSigningKey(c.Request.Context(), key.ID, req.Note); err != nil {
+		if errors.Is(err, store.ErrSigningKeyInactive) || errors.Is(err, store.ErrSigningKeyNotFound) {
+			// Deactivated or rotated out meanwhile.
+			response.NotFound(c, "no active signing key for this product")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}

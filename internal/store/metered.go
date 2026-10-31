@@ -2,10 +2,55 @@ package store
 
 import (
 	"context"
+	"database/sql/driver"
 	"time"
 
 	"github.com/tabloy/keygate/internal/model"
 )
+
+// meteredSyncLockKey names the advisory lock one metered sync pass
+// holds (see TryMeteredSyncLock), apart from the other advisory locks.
+const meteredSyncLockKey int64 = 0x6b676d657465 // "kgmete"
+
+// TryMeteredSyncLock takes the metered sync lock if no other pass holds
+// it, on any replica. Every replica runs the sync loop, and the rows a
+// pass reads are not claimed: two passes at once pushed each row twice
+// and counted two attempts for it, so a short Stripe outage spent a
+// row's retries at twice the rate. ok is false when another pass is
+// running; release must be called once the pass is done otherwise.
+//
+// The lock is held by a connection of its own, for the pass, and goes
+// with it if the process dies.
+func (s *Store) TryMeteredSyncLock(ctx context.Context) (release func(), ok bool, err error) {
+	conn, err := s.DB.DB.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", meteredSyncLockKey).Scan(&ok); err != nil {
+		// The lock may have been taken and the answer lost: the
+		// connection is discarded, not pooled, which releases it.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		_ = conn.Close()
+		return nil, false, err
+	}
+	if !ok {
+		_ = conn.Close()
+		return nil, false, nil
+	}
+	return func() {
+		// A fresh context: the pass's may be done, and a lock left on a
+		// pooled connection would hold every later pass off.
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.ExecContext(unlockCtx, "SELECT pg_advisory_unlock($1)", meteredSyncLockKey); err != nil {
+			// Unsure whether it was released: the connection is
+			// discarded rather than returned to the pool, which
+			// releases it.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}, true, nil
+}
 
 // InsertMeteredEvent appends an event-log row to be pushed to Stripe
 // by MeteredBillingSync. quantity is the DELTA from this single
@@ -34,10 +79,22 @@ func (s *Store) InsertMeteredEvent(ctx context.Context, licenseID, feature, peri
 // enough of them at the head of the queue would fill every batch and
 // starve rows that could.
 func (s *Store) ListUnsyncedMetered(ctx context.Context, limit, maxAttempts int) ([]*model.MeteredBilling, error) {
+	return s.ListUnsyncedMeteredAfter(ctx, nil, limit, maxAttempts)
+}
+
+// ListUnsyncedMeteredAfter is ListUnsyncedMetered from after the row
+// last (nil: from the start), in (created_at, id) order: a pass sending
+// the whole queue in batches goes on past rows it tried, whether they
+// were sent or failed, rather than meeting a failed one again at the
+// head of the queue and spending its retries at once.
+func (s *Store) ListUnsyncedMeteredAfter(ctx context.Context, last *model.MeteredBilling, limit, maxAttempts int) ([]*model.MeteredBilling, error) {
 	var out []*model.MeteredBilling
-	err := s.DB.NewSelect().Model(&out).
-		Where("synced = false AND attempts < ?", maxAttempts).
-		OrderExpr("created_at ASC").Limit(limit).Scan(ctx)
+	q := s.DB.NewSelect().Model(&out).
+		Where("synced = false AND attempts < ?", maxAttempts)
+	if last != nil {
+		q = q.Where("(created_at, id) > (?, ?)", last.CreatedAt, last.ID)
+	}
+	err := q.OrderExpr("created_at ASC, id ASC").Limit(limit).Scan(ctx)
 	return out, err
 }
 

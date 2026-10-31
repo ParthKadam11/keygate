@@ -492,7 +492,14 @@ func (h *ReleaseAdminHandler) List(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
-	listOK(c, "releases", releases, total, page)
+	// The newest published version per product and channel, whatever
+	// the filter and page: what the dashboard warns a draft against.
+	latest, err := h.store.LatestPublishedVersions(c.Request.Context(), productID)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	listOK(c, "releases", releases, total, page, gin.H{"latest_published": latest})
 }
 
 // GET /api/v1/admin/releases/:id

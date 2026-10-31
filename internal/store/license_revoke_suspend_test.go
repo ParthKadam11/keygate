@@ -154,3 +154,72 @@ func TestRevokeLicense_FailedSubscriptionSyncRollsBack(t *testing.T) {
 		t.Errorf("activations = %d (err %v), want the device kept", n, err)
 	}
 }
+
+// An activation or floating checkout that read the licence usable before
+// it was revoked or suspended is refused under the licence lock: the
+// store sees the licence as it is now, not as the caller found it.
+func TestActivateAndCheckOut_RefusedOnceRevokedOrSuspended(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+
+	roomy := func(lic *model.License) *model.License {
+		t.Helper()
+		if _, err := s.DB.NewRaw("UPDATE plans SET max_activations = 5 WHERE id = ?", lic.PlanID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return lic
+	}
+	activate := func(lic *model.License, device string) error {
+		return s.ActivateForKey(ctx, &model.Activation{LicenseID: lic.ID, Identifier: device, IdentifierType: "device"}, 5, lic.LicenseKey)
+	}
+	checkOut := func(lic *model.License, machine string) error {
+		_, err := s.CheckOutFloatingForKey(ctx, &model.FloatingSession{LicenseID: lic.ID, Identifier: machine,
+			ExpiresAt: time.Now().Add(time.Hour)}, 5, lic.LicenseKey)
+		return err
+	}
+
+	revoked := roomy(newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil))
+	if err := activate(revoked, "before"); err != nil {
+		t.Fatalf("activate while active: %v", err)
+	}
+	if err := s.RevokeLicense(ctx, revoked.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := activate(revoked, "after"); !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("activate after revoke: err = %v, want ErrKeyRevoked", err)
+	}
+	if err := checkOut(revoked, "after"); !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("checkout after revoke: err = %v, want ErrKeyRevoked", err)
+	}
+	if n, _ := s.CountActivations(ctx, revoked.ID); n != 0 {
+		t.Errorf("revoked license has %d activations, want 0", n)
+	}
+
+	suspended := roomy(newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil))
+	if err := activate(suspended, "before"); err != nil {
+		t.Fatalf("activate while active: %v", err)
+	}
+	if err := s.SuspendLicense(ctx, suspended.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := activate(suspended, "after"); !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("activate after suspend: err = %v, want ErrKeyRevoked", err)
+	}
+	if err := checkOut(suspended, "after"); !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("checkout after suspend: err = %v, want ErrKeyRevoked", err)
+	}
+	// Reinstated, it takes devices again; the one from before stayed.
+	if _, err := s.ReinstateLicense(ctx, suspended.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := activate(suspended, "after"); err != nil {
+		t.Errorf("activate after reinstate: %v", err)
+	}
+	if err := checkOut(suspended, "after"); err != nil {
+		t.Errorf("checkout after reinstate: %v", err)
+	}
+	if n, _ := s.CountActivations(ctx, suspended.ID); n != 2 {
+		t.Errorf("reinstated license has %d activations, want 2", n)
+	}
+}

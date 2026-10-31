@@ -140,7 +140,18 @@ func guardedLicense(c *gin.Context, st *store.Store) (lic *model.License, email 
 	var req struct {
 		LicenseKey string `json:"license_key"`
 	}
-	if json.Unmarshal(body, &req) != nil || req.LicenseKey == "" {
+	// Read as c.ShouldBindJSON reads it, the first JSON value with
+	// anything after it ignored, so the key checked here is the key the
+	// handler acts on. json.Unmarshal refused a body with trailing bytes
+	// that the handler accepted, and the guard waved such a request
+	// through as one with no key. A body that does not parse is refused
+	// here, as the handler would refuse it.
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		response.BadRequest(c, "invalid request body")
+		c.Abort()
+		return nil, "", false
+	}
+	if req.LicenseKey == "" {
 		return nil, "", true
 	}
 	// Defense in depth: a malformed JWT that produced an empty email

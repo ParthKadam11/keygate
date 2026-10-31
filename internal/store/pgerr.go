@@ -51,6 +51,19 @@ func IsForeignKeyViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Field('C') == "23503"
 }
 
+// IsStillReferenced reports whether err is a delete refused because rows
+// still refer to the row: a foreign key (23503) or a restrict (23001)
+// violation. A delete that counted those rows first and found none met
+// one added after the count.
+func IsStillReferenced(err error) bool {
+	var pgErr pgdriver.Error
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	code := pgErr.Field('C')
+	return code == "23503" || code == "23001"
+}
+
 // IsTrialFallbackMissing reports whether err is the foreign key on
 // plans.trial_fallback_plan_id: the plan named as a trial's fallback
 // does not exist (deleted after it was checked).

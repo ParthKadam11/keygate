@@ -54,3 +54,32 @@ func TestSweeps_ChangedSinceReadIsNotAnnounced(t *testing.T) {
 		t.Fatalf("past due: %d expired audit lines for a licence that was paid", n)
 	}
 }
+
+// The grace is the plan's when the licence is written, not when it was
+// read: raised meanwhile, a licence now within it stays active.
+func TestGraceSweep_GraceRaisedSinceReadIsKept(t *testing.T) {
+	f := newFallbackFixture(t)
+	plan := f.paidPlan(2)
+	raised := f.licenseIn(plan, model.StatusActive, ago(3*day))
+	f.c.EndGraceExpiredUpgrade = func(ctx context.Context, l *model.License, _ time.Time) (bool, error) {
+		if l.ID == raised.ID {
+			if _, err := f.s.DB.NewRaw("UPDATE plans SET grace_days = 10 WHERE id = ?", l.PlanID).Exec(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return false, nil
+	}
+	f.c.ExpireGracePeriodLicenses(f.ctx)
+	if got := f.load(raised).Status; got != model.StatusActive {
+		t.Fatalf("licence within the grace raised since the read is %s, want active", got)
+	}
+
+	// Past the raised grace too, it goes.
+	if _, err := f.s.DB.NewRaw("UPDATE licenses SET valid_until = ? WHERE id = ?", ago(11*day), raised.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.c.ExpireGracePeriodLicenses(f.ctx)
+	if got := f.load(raised).Status; got != model.StatusExpired {
+		t.Fatalf("licence past the raised grace is %s, want expired", got)
+	}
+}

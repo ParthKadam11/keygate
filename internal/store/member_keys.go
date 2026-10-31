@@ -256,10 +256,14 @@ func (s *Store) MarkPausedSeats(ctx context.Context, licenseID string, seats []*
 // keyHeldIn reports whether key still opens the licence the way the
 // caller found it: as the member's key when seatID is set (while the
 // product has seats, as FindLicenseByKey holds it), else as the
-// licence's own.
+// licence's own. Nor once the licence is revoked or suspended: the
+// caller read it usable before taking the licence lock, and a revoke or
+// suspend that committed in between must not be followed by a new
+// device or session on it.
 func keyHeldIn(ctx context.Context, tx bun.Tx, licenseID, seatID, key string) (bool, error) {
 	var held bool
 	var err error
+	stopped := bun.In([]string{model.StatusRevoked, model.StatusSuspended})
 	if seatID != "" {
 		// Not while the member is paused (over the seat limit): read
 		// under the licence lock, so a seat change cannot slip between.
@@ -267,12 +271,12 @@ func keyHeldIn(ctx context.Context, tx bun.Tx, licenseID, seatID, key string) (b
 			JOIN licenses l ON l.id = s.license_id JOIN products p ON p.id = l.product_id
 			JOIN plans pl ON pl.id = l.plan_id
 			WHERE s.id = ? AND s.license_id = ? AND s.member_key_hash = ? AND s.removed_at IS NULL
-			AND s.accepted_at IS NOT NULL AND p.type IN (?) AND NOT (`+seatPausedSQL+`))`,
-			seatID, licenseID, license.HashKey(key), bun.In(model.ProductTypesSupporting(model.CapSeats))).Scan(ctx, &held)
+			AND s.accepted_at IS NOT NULL AND p.type IN (?) AND l.status NOT IN (?) AND NOT (`+seatPausedSQL+`))`,
+			seatID, licenseID, license.HashKey(key), bun.In(model.ProductTypesSupporting(model.CapSeats)), stopped).Scan(ctx, &held)
 	} else {
 		err = tx.NewRaw(`SELECT EXISTS (SELECT 1 FROM licenses
-			WHERE id = ? AND (key_hash = ? OR license_key = ?))`,
-			licenseID, license.HashKey(key), key).Scan(ctx, &held)
+			WHERE id = ? AND (key_hash = ? OR license_key = ?) AND status NOT IN (?))`,
+			licenseID, license.HashKey(key), key, stopped).Scan(ctx, &held)
 	}
 	return held, err
 }

@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
+	"golang.org/x/mod/semver"
 
 	"github.com/tabloy/keygate/internal/model"
 )
@@ -30,9 +33,15 @@ var (
 	ErrReleaseNoArtifacts        = errors.New("release has no artifacts")
 	ErrReleaseArtifactsNotReady  = errors.New("one or more artifacts have not finished uploading")
 	ErrReleaseArtifactsNotSigned = errors.New("one or more artifacts are missing required signatures")
+	// ErrReleaseSigningKeyRetired: the key the release was signed with
+	// was rotated out or deactivated before the publish committed.
+	ErrReleaseSigningKeyRetired = errors.New("the signing key was retired during publish")
 
 	// Artifact-related.
-	ErrArtifactNotFound      = errors.New("release artifact not found")
+	ErrArtifactNotFound = errors.New("release artifact not found")
+	// ErrArtifactReplaced: a signature was for a file the artifact no
+	// longer points at (finalized again while it was being signed).
+	ErrArtifactReplaced      = errors.New("release artifact was replaced while it was being signed")
 	ErrArtifactAlreadyExists = errors.New("release already has an artifact for this platform")
 )
 
@@ -144,11 +153,19 @@ func ProductHasEverPublishedReleaseIn(ctx context.Context, db bun.IDB, productID
 
 // CreateRelease inserts a new release in the draft state. No artifacts —
 // callers add platform-specific artifacts via AddArtifact.
+// CreateRelease inserts a release, while the product's type has
+// releases (ErrProductNoReleases otherwise, see ProductShapeLockIn).
 func (s *Store) CreateRelease(ctx context.Context, r *model.Release) error {
 	if r.ID == "" {
 		r.ID = newID()
 	}
-	_, err := s.DB.NewInsert().Model(r).Exec(ctx)
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		if err := releasesAllowedIn(ctx, tx, r.ProductID); err != nil {
+			return err
+		}
+		_, err := tx.NewInsert().Model(r).Exec(ctx)
+		return err
+	})
 	if isUniqueViolation(err) {
 		return ErrReleaseAlreadyExists
 	}
@@ -252,6 +269,46 @@ func applyReleaseFilters(q *bun.SelectQuery, f ReleaseFilter) *bun.SelectQuery {
 	return q
 }
 
+// LatestPublished is the highest published version of one product on
+// one channel.
+type LatestPublished struct {
+	ProductID string `json:"product_id"`
+	Channel   string `json:"channel"`
+	Version   string `json:"version"`
+}
+
+// LatestPublishedVersions returns, for each product (or the one named)
+// and channel, its highest published version by semver. The release
+// list is paged and filtered; this is what it is compared with, so a
+// draft below what is already out says so whatever page it is on.
+func (s *Store) LatestPublishedVersions(ctx context.Context, productID string) ([]LatestPublished, error) {
+	var rows []LatestPublished
+	q := s.DB.NewSelect().Model((*model.Release)(nil)).
+		Column("product_id", "channel", "version").
+		Where("status = ?", model.ReleaseStatusPublished)
+	if productID != "" {
+		q = q.Where("product_id = ?", productID)
+	}
+	if err := q.Scan(ctx, &rows); err != nil {
+		return nil, err
+	}
+	best := map[[2]string]string{}
+	for _, r := range rows {
+		k := [2]string{r.ProductID, r.Channel}
+		if cur, ok := best[k]; !ok || semver.Compare("v"+r.Version, "v"+cur) > 0 {
+			best[k] = r.Version
+		}
+	}
+	out := make([]LatestPublished, 0, len(best))
+	for k, v := range best {
+		out = append(out, LatestPublished{ProductID: k[0], Channel: k[1], Version: v})
+	}
+	slices.SortFunc(out, func(a, b LatestPublished) int {
+		return strings.Compare(a.ProductID+"|"+a.Channel, b.ProductID+"|"+b.Channel)
+	})
+	return out, nil
+}
+
 // PublishRelease atomically transitions draft → published. The UPDATE
 // inlines every invariant a published release must satisfy:
 //
@@ -276,8 +333,50 @@ func applyReleaseFilters(q *bun.SelectQuery, f ReleaseFilter) *bun.SelectQuery {
 // publishes overlapping a key rotation can otherwise interleave their
 // per-artifact signature writes and ship a release whose platforms
 // verify against different public keys.
+//
+// The key must still be active when the release goes live, and is held
+// so until the publish commits: a rotation or deactivation waits for it,
+// or, coming first, refuses the publish (ErrReleaseSigningKeyRetired).
+// Otherwise a release could go out signed by a key already withdrawn,
+// which clients holding the published public key reject.
 func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures bool, signingKeyID string) error {
-	res, err := s.DB.NewRaw(`
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	// The release row first, in its own statement, as every artifact
+	// writer takes it (UpdateArtifactFile, UpdateArtifactSignature,
+	// DeleteArtifact). The gate below then runs on a snapshot taken once
+	// the lock is held. As one statement that waited for the lock, it
+	// re-checked only the release row and judged the artifacts by the
+	// snapshot from before it waited: a finalize that cleared a signature
+	// meanwhile left a release published unsigned, its bytes never
+	// signed.
+	var status string
+	if err := tx.NewRaw(`SELECT status FROM releases WHERE id = ? FOR UPDATE`, id).Scan(ctx, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrReleaseNotFound
+		}
+		return err
+	}
+	if status != model.ReleaseStatusDraft {
+		// Published by another call meanwhile: that, not the key.
+		return ErrReleaseNotPublishable
+	}
+	if signingKeyID != "" {
+		// No such key matches no artifact's signing_key_id, which the
+		// gate below refuses as unsigned.
+		var active bool
+		err := tx.NewRaw(`SELECT active FROM release_signing_keys WHERE id = ? FOR SHARE`, signingKeyID).Scan(ctx, &active)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err == nil && !active {
+			return ErrReleaseSigningKeyRetired
+		}
+	}
+	res, err := tx.NewRaw(`
 		UPDATE releases
 		SET status = ?, published_at = now(), updated_at = now()
 		WHERE id = ?
@@ -302,9 +401,10 @@ func (s *Store) PublishRelease(ctx context.Context, id string, requireSignatures
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		tx.Rollback() //nolint:errcheck
 		return s.diagnoseUnpublishable(ctx, id, requireSignatures, signingKeyID)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // diagnoseUnpublishable returns the most specific reason a publish gate
@@ -387,16 +487,39 @@ func (s *Store) YankRelease(ctx context.Context, id, reason string) error {
 }
 
 // UnyankRelease undoes a yank: yanked → published.
+// UnyankRelease puts a yanked release back on sale, while the product's
+// type has releases (ErrProductNoReleases otherwise): the type may
+// change once every release is yanked, and one restored on a type
+// without releases would be unreachable.
 func (s *Store) UnyankRelease(ctx context.Context, id string) error {
-	res, err := s.DB.NewUpdate().Model((*model.Release)(nil)).
-		Set("status = ?, yanked_reason = '', yanked_at = NULL, updated_at = now()",
-			model.ReleaseStatusPublished).
-		Where("id = ? AND status = ?", id, model.ReleaseStatusYanked).
-		Exec(ctx)
+	var missed bool
+	err := RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		var productID string
+		if err := tx.NewRaw("SELECT product_id FROM releases WHERE id = ?", id).Scan(ctx, &productID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrReleaseNotFound
+			}
+			return err
+		}
+		if err := releasesAllowedIn(ctx, tx, productID); err != nil {
+			return err
+		}
+		res, err := tx.NewUpdate().Model((*model.Release)(nil)).
+			Set("status = ?, yanked_reason = '', yanked_at = NULL, updated_at = now()",
+				model.ReleaseStatusPublished).
+			Where("id = ? AND status = ?", id, model.ReleaseStatusYanked).
+			Exec(ctx)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		missed = n == 0
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if missed {
 		return s.classifyReleaseUpdateMiss(ctx, id, ErrReleaseNotYankable)
 	}
 	return nil
@@ -630,12 +753,17 @@ func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size
 		return ErrReleaseNotPublishable
 	}
 
-	if _, err := tx.NewRaw(`
+	// The artifact was read before the release lock was held: deleted
+	// while this waited for it, nothing is updated, and that is a miss.
+	if err := deletedOne(tx.NewRaw(`
 		UPDATE release_artifacts
 		SET file_key = ?, file_size = ?, sha256 = ?, content_type = ?,
 		    ed25519_sig = '', tauri_signature = '', signing_key_id = NULL, updated_at = now()
 		WHERE id = ?
-	`, fileKey, size, sha256, contentType, id).Exec(ctx); err != nil {
+	`, fileKey, size, sha256, contentType, id).Exec(ctx)); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrArtifactNotFound
+		}
 		return err
 	}
 	return tx.Commit()
@@ -697,6 +825,16 @@ func (s *Store) ClearReleaseSignatures(ctx context.Context, releaseID string) er
 // waits behind an in-flight PublishRelease and then sees its committed
 // status, instead of racing it on an MVCC snapshot.
 func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKeyID, tauriSig string) error {
+	return s.UpdateArtifactSignatureOf(ctx, id, "", "", sig, signingKeyID, tauriSig)
+}
+
+// UpdateArtifactSignatureOf is UpdateArtifactSignature for the file the
+// signer read: written only while the artifact still points at fileKey
+// with that sha256, ErrArtifactReplaced otherwise. A finalize landing
+// while a publish signed the artifact would otherwise be given the
+// signature of the file it replaced, and clients would reject the
+// release. An empty fileKey writes whatever the artifact points at.
+func (s *Store) UpdateArtifactSignatureOf(ctx context.Context, id, fileKey, sha256, sig, signingKeyID, tauriSig string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -719,10 +857,27 @@ func (s *Store) UpdateArtifactSignature(ctx context.Context, id, sig, signingKey
 	if releaseStatus != model.ReleaseStatusDraft {
 		return ErrReleaseNotPublishable
 	}
-	if _, err := tx.NewUpdate().Model((*model.ReleaseArtifact)(nil)).
+	// Deleted while this waited for the release lock (see
+	// UpdateArtifactFile): the publish signing it learns it is gone,
+	// rather than going live without that platform.
+	q := tx.NewUpdate().Model((*model.ReleaseArtifact)(nil)).
 		Set("ed25519_sig = ?, signing_key_id = ?, tauri_signature = ?, updated_at = now()", sig, signingKeyID, tauriSig).
-		Where("id = ?", id).Exec(ctx); err != nil {
-		return err
+		Where("id = ?", id)
+	if fileKey != "" {
+		q = q.Where("file_key = ? AND sha256 = ?", fileKey, sha256)
+	}
+	if err := deletedOne(q.Exec(ctx)); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var still bool
+		if err := tx.NewRaw("SELECT EXISTS (SELECT 1 FROM release_artifacts WHERE id = ?)", id).Scan(ctx, &still); err != nil {
+			return err
+		}
+		if still {
+			return ErrArtifactReplaced
+		}
+		return ErrArtifactNotFound
 	}
 	return tx.Commit()
 }
@@ -768,14 +923,19 @@ func (s *Store) DeleteArtifact(ctx context.Context, id string) (fileKey string, 
 	}
 	defer tx.Rollback() //nolint:errcheck
 
+	// The release is locked first and the artifact only by the delete,
+	// in the order UpdateArtifactSignature and UpdateArtifactFile take
+	// them; locking both at once took them in whatever order the plan
+	// joined them, and could deadlock with a publish signing it. The
+	// file key is read by the delete, as it is once the lock is held.
 	var releaseStatus string
 	if err := tx.NewRaw(`
-		SELECT r.status, ra.file_key
+		SELECT r.status
 		FROM release_artifacts ra
 		JOIN releases r ON r.id = ra.release_id
 		WHERE ra.id = ?
-		FOR UPDATE
-	`, id).Scan(ctx, &releaseStatus, &fileKey); err != nil {
+		FOR UPDATE OF r
+	`, id).Scan(ctx, &releaseStatus); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", ErrArtifactNotFound
 		}
@@ -785,8 +945,11 @@ func (s *Store) DeleteArtifact(ctx context.Context, id string) (fileKey string, 
 		return "", ErrReleaseNotPublishable
 	}
 
-	if _, err := tx.NewDelete().Model((*model.ReleaseArtifact)(nil)).
-		Where("id = ?", id).Exec(ctx); err != nil {
+	if err := tx.NewRaw(`DELETE FROM release_artifacts WHERE id = ? RETURNING file_key`, id).
+		Scan(ctx, &fileKey); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrArtifactNotFound
+		}
 		return "", err
 	}
 	if err := tx.Commit(); err != nil {

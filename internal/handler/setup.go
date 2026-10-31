@@ -82,9 +82,14 @@ func (h *SetupHandler) Initialize(c *gin.Context) {
 		response.BadRequest(c, "product_type must be one of: saas, desktop, hybrid")
 		return
 	}
-	if err := apperr.ValidateName("product_name", req.ProductName); err != nil {
-		response.BadRequest(c, err.Message)
-		return
+	// The owner's name rides in the session token, so an unbounded one
+	// makes a cookie the browser drops: sign-in then succeeds and every
+	// request after it is refused.
+	for field, value := range map[string]string{"admin_name": req.AdminName, "site_name": req.SiteName, "product_name": req.ProductName} {
+		if err := apperr.ValidateName(field, value); err != nil {
+			response.BadRequest(c, err.Message)
+			return
+		}
 	}
 	if err := apperr.ValidateSlug(req.ProductSlug); err != nil {
 		response.BadRequest(c, err.Message)

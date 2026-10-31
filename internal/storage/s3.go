@@ -239,6 +239,86 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// copyPartSize is the part a large object is copied in: CopyObject
+// takes at most 5 GiB, and the parts of a multipart copy at most that
+// too.
+const copyPartSize int64 = 512 << 20
+
+// maxSingleCopy is the largest object CopyObject copies at once.
+const maxSingleCopy int64 = 5 << 30
+
+// Copy copies src to dst inside the bucket: CopyObject up to 5 GiB, a
+// multipart copy in copyPartSize parts above it.
+func (s *S3Storage) Copy(ctx context.Context, src, dst string, size int64) error {
+	if src == "" || dst == "" {
+		return errors.New("storage: empty key")
+	}
+	source := (&url.URL{Path: s.bucket + "/" + src}).EscapedPath()
+	if size <= maxSingleCopy {
+		_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     aws.String(s.bucket),
+			Key:        aws.String(dst),
+			CopySource: aws.String(source),
+		})
+		if err != nil {
+			if isS3NotFound(err) {
+				return ErrObjectNotFound
+			}
+			return fmt.Errorf("storage: copy: %w", err)
+		}
+		return nil
+	}
+	// CopyObject carries the source's Content-Type over; a multipart
+	// copy starts a new object, so it is given it here.
+	src0, err := s.Head(ctx, src)
+	if err != nil {
+		return err
+	}
+	create := &s3.CreateMultipartUploadInput{Bucket: aws.String(s.bucket), Key: aws.String(dst)}
+	if src0.ContentType != "" {
+		create.ContentType = aws.String(src0.ContentType)
+	}
+	up, err := s.client.CreateMultipartUpload(ctx, create)
+	if err != nil {
+		return fmt.Errorf("storage: copy: start: %w", err)
+	}
+	abort := func() {
+		_, _ = s.client.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(dst), UploadId: up.UploadId,
+		})
+	}
+	var parts []types.CompletedPart
+	for n, start := int32(1), int64(0); start < size; n, start = n+1, start+copyPartSize {
+		end := min(start+copyPartSize, size) - 1
+		out, err := s.client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket:          aws.String(s.bucket),
+			Key:             aws.String(dst),
+			UploadId:        up.UploadId,
+			PartNumber:      aws.Int32(n),
+			CopySource:      aws.String(source),
+			CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+		})
+		if err != nil {
+			abort()
+			if isS3NotFound(err) {
+				return ErrObjectNotFound
+			}
+			return fmt.Errorf("storage: copy: part %d: %w", n, err)
+		}
+		parts = append(parts, types.CompletedPart{ETag: out.CopyPartResult.ETag, PartNumber: aws.Int32(n)})
+	}
+	if _, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          aws.String(s.bucket),
+		Key:             aws.String(dst),
+		UploadId:        up.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}); err != nil {
+		abort()
+		return fmt.Errorf("storage: copy: complete: %w", err)
+	}
+	return nil
+}
+
 // ─── Helpers ───
 
 // clampPresignTTL applies the [minPresignTTL, maxPresignTTL] envelope.

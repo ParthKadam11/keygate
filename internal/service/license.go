@@ -444,6 +444,10 @@ func (s *LicenseService) Deactivate(ctx context.Context, in DeactivateInput) err
 	}
 
 	if err := s.store.DeleteActivation(ctx, act.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Released meanwhile by another call, which reports it.
+			return licenseNotFound()
+		}
 		return apperr.Internal(err)
 	}
 

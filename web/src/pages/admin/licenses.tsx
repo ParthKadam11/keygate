@@ -120,14 +120,21 @@ export default function LicensesPage() {
   const products = productsData?.products || []
   const { items: licenses, total, totalPages } = pg.from(data, data?.licenses)
 
+  // Set as the form is submitted, before the mutation is pending, so a
+  // double click issues one license, not two.
+  const issuing = useRef(false)
   const createMut = useMutation({
     mutationFn: admin.createLicense,
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "licenses"] })
+      // The dashboard's totals and the product's counts change too.
+      qc.invalidateQueries({ queryKey: ["admin"] })
       setCreating(false)
       showToast(t("toast.licenseCreated"), "success")
     },
     onError: (e: Error) => showToast(e.message, "error"),
+    onSettled: () => {
+      issuing.current = false
+    },
   })
 
   if (!isLoading && products.length === 0) {
@@ -312,7 +319,11 @@ export default function LicensesPage() {
           open
           onClose={() => setCreating(false)}
           products={products}
-          onSubmit={(d) => createMut.mutate(d)}
+          onSubmit={(d) => {
+            if (issuing.current) return
+            issuing.current = true
+            createMut.mutate(d)
+          }}
           loading={createMut.isPending}
         />
       )}
@@ -529,8 +540,11 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
   })
   const reinstateMut = useMutation({
     mutationFn: () => admin.reinstateLicense(id),
-    onSuccess: () => {
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["admin"] })
+      // Reinstated, but its expiry ran out while it was suspended.
+      if (res && res.usable === false)
+        showToast(t(lic?.stripe_subscription_id ? "licenses.reinstatedLapsedStripe" : "licenses.reinstatedLapsed"))
     },
     onError: (e: Error) => showToast(e.message, "error"),
   })
@@ -556,7 +570,11 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
       qc.invalidateQueries({ queryKey: ["admin"] })
       setEditingUpdatesUntil(null)
     },
-    onError: (e: Error) => showToast(e.message, "error"),
+    onError: (e: Error) =>
+      showToast(
+        errorCode(e) === "MAINTENANCE_FEATURES_DISABLED" ? t("licenses.maintenanceDisabled") : e.message,
+        "error",
+      ),
   })
   // Activation deletion is destructive — wrap in a confirmation
   // state so a stray ghost-click on the trash icon (icons sit
@@ -565,7 +583,8 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
   const deleteActMut = useMutation({
     mutationFn: admin.deleteActivation,
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["admin", "license", id] })
+      // The list behind the dialog counts devices too.
+      qc.invalidateQueries({ queryKey: ["admin"] })
       setConfirmDeactivation(null)
     },
     onError: (e: Error) => showToast(e.message, "error"),

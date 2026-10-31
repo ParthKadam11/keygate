@@ -213,7 +213,14 @@ func isLoopbackURL(raw string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (c *Config) IsDevLoginAllowed() bool { return c.normalizedEnv() == "development" }
+// IsDevLoginAllowed reports whether this server offers dev-login:
+// ENVIRONMENT=development with a BASE_URL on this machine. The host is
+// parsed, so a public name that merely contains "localhost"
+// (https://localhost.example.com) does not pass. The handler further
+// takes only a caller on this machine (see AuthHandler.devLoginOpen).
+func (c *Config) IsDevLoginAllowed() bool {
+	return c.normalizedEnv() == "development" && isLoopbackURL(c.BaseURL)
+}
 
 // IsAdminEmail checks if an email is in the ADMIN_EMAILS list.
 // Used for backward compatibility and initial setup bootstrap.

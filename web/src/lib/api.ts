@@ -434,7 +434,8 @@ export const admin = {
     post<License>(`/admin/licenses/${id}/updates-until`, { updates_until: updatesUntil }),
   revokeLicense: (id: string) => post(`/admin/licenses/${id}/revoke`),
   suspendLicense: (id: string) => post(`/admin/licenses/${id}/suspend`),
-  reinstateLicense: (id: string) => post(`/admin/licenses/${id}/reinstate`),
+  reinstateLicense: (id: string) =>
+    post<{ status: string; usable?: boolean; notice?: string }>(`/admin/licenses/${id}/reinstate`),
   refundLicense: (id: string) => post(`/admin/licenses/${id}/refund`),
 
   deleteActivation: (id: string) => del(`/admin/activations/${id}`),
@@ -669,7 +670,15 @@ export const admin = {
     if (params?.status) q.set("status", params.status)
     if (params?.limit) q.set("limit", String(params.limit))
     if (params?.offset) q.set("offset", String(params.offset))
-    return get<{ releases: Release[]; total: number; limit: number; offset: number }>(`/admin/releases?${q}`)
+    return get<{
+      releases: Release[]
+      total: number
+      limit: number
+      offset: number
+      // Highest published version per product and channel, whatever the
+      // filter and page.
+      latest_published?: { product_id: string; channel: string; version: string }[]
+    }>(`/admin/releases?${q}`)
   },
   getRelease: (id: string) => get<Release>(`/admin/releases/${id}`),
   createRelease: (data: {
