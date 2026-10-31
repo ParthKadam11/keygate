@@ -42,6 +42,27 @@ func activate(s *store.Store, ctx context.Context, licenseID, identifier string,
 	}, max)
 }
 
+// A pause that lands after the caller's usable check must still refuse
+// under the licence row lock: otherwise Activate takes a device on a
+// suspended licence.
+func TestActivateWithinLimit_RefusesWhenSuspendedUnderLock(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	lic := activationLicense(t, s, ctx, 5)
+	if _, err := s.DB.NewRaw("UPDATE licenses SET status = 'suspended', suspended_by = 'stripe', suspended_at = now() WHERE id = ?", lic.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	err := activate(s, ctx, lic.ID, "after-pause", 5)
+	if !errors.Is(err, store.ErrLicenseNotUsable) {
+		t.Fatalf("err = %v, want ErrLicenseNotUsable", err)
+	}
+	n, err := s.CountActivations(ctx, lic.ID)
+	if err != nil || n != 0 {
+		t.Fatalf("activations = %d (err %v), want 0", n, err)
+	}
+}
+
 // One machine asking twice at once is a repeat, not a contest.
 //
 // The service looks for an existing activation before calling, but

@@ -68,6 +68,10 @@ func (s *FloatingService) CheckOut(ctx context.Context, in CheckOutInput) (*Chec
 	// This prevents race conditions where concurrent checkouts could exceed maxSessions
 	isNew, err := s.store.CheckOutFloatingForKey(ctx, sess, maxSessions, in.LicenseKey)
 	if err != nil {
+		// Pause/cancel under the lock: same 404 as loadLicenseForSDK.
+		if errors.Is(err, store.ErrLicenseNotUsable) {
+			return nil, licenseNotFound()
+		}
 		// Removed or replaced since it was looked up: a key that no
 		// longer exists.
 		if errors.Is(err, store.ErrKeyRevoked) {

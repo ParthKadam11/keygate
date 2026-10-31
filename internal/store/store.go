@@ -2517,6 +2517,12 @@ func (s *Store) ClaimProcessedEvent(ctx context.Context, provider, eventID strin
 
 // ─── Transactional Activation ───
 
+// ErrLicenseNotUsable: under the licence row lock the licence is no
+// longer usable (suspended, revoked, expired, or canceled past its
+// paid-through date). Callers that checked usability before the lock
+// must not take a slot or sign from a stale copy.
+var ErrLicenseNotUsable = errors.New("license is not usable")
+
 // lockLicenseLimitsIn takes the licence row lock every "count, then take
 // a slot" check serialises on, and reads the limits the licence holds
 // under it (see model.Plan.Limits). The caller's limit came from a read
@@ -2525,22 +2531,37 @@ func (s *Store) ClaimProcessedEvent(ctx context.Context, provider, eventID strin
 // slot from being taken on a limit that is already gone. known is false
 // when the licence or its plan is not there to read, and the caller's
 // limit stands alone.
+//
+// It also re-checks status under the lock: a Stripe pause can land after
+// the caller's assertUsable and before this lock, and without the
+// re-check Activate would still take a device and sign a token from the
+// stale in-memory copy.
 func lockLicenseLimitsIn(ctx context.Context, tx bun.Tx, licenseID string) (seats, activations int, known bool, err error) {
 	var rows []struct {
-		Quantity       int   `bun:"quantity"`
-		PerSeat        *bool `bun:"per_seat"`
-		MaxSeats       *int  `bun:"max_seats"`
-		MaxActivations *int  `bun:"max_activations"`
+		Quantity       int        `bun:"quantity"`
+		Status         string     `bun:"status"`
+		ValidUntil     *time.Time `bun:"valid_until"`
+		PerSeat        *bool      `bun:"per_seat"`
+		MaxSeats       *int       `bun:"max_seats"`
+		MaxActivations *int       `bun:"max_activations"`
 	}
-	if err := tx.NewRaw(`SELECT l.quantity, p.per_seat, p.max_seats, p.max_activations
+	if err := tx.NewRaw(`SELECT l.quantity, l.status, l.valid_until,
+		p.per_seat, p.max_seats, p.max_activations
 		FROM licenses l LEFT JOIN plans p ON p.id = l.plan_id
 		WHERE l.id = ? FOR UPDATE OF l`, licenseID).Scan(ctx, &rows); err != nil {
 		return 0, 0, false, err
 	}
-	if len(rows) == 0 || rows[0].PerSeat == nil || rows[0].MaxSeats == nil || rows[0].MaxActivations == nil {
+	if len(rows) == 0 {
 		return 0, 0, false, nil
 	}
 	r := rows[0]
+	if slices.Contains(stoppedStatuses, r.Status) ||
+		(r.Status == model.StatusCanceled && (r.ValidUntil == nil || !time.Now().Before(*r.ValidUntil))) {
+		return 0, 0, false, ErrLicenseNotUsable
+	}
+	if r.PerSeat == nil || r.MaxSeats == nil || r.MaxActivations == nil {
+		return 0, 0, false, nil
+	}
 	plan := model.Plan{PerSeat: *r.PerSeat, MaxSeats: *r.MaxSeats, MaxActivations: *r.MaxActivations}
 	seats, activations = plan.Limits(r.Quantity)
 	return seats, activations, true, nil

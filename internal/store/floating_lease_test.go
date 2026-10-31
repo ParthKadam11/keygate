@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -386,6 +387,26 @@ func TestFloatingLicenseReportsSessionsNotActivations(t *testing.T) {
 	}
 	if one.ActiveSessionCount != 1 {
 		t.Errorf("after one lease lapsed ActiveSessionCount = %d, want 1", one.ActiveSessionCount)
+	}
+}
+
+// A pause under the licence lock must refuse a new checkout: the
+// caller's usable check ran before the lock.
+func TestCheckOutFloating_RefusesWhenSuspendedUnderLock(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	lic := floatingLicense(t, s, ctx)
+	if _, err := s.DB.NewRaw("UPDATE licenses SET status = 'suspended', suspended_by = 'stripe', suspended_at = now() WHERE id = ?", lic.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, err := checkOut(t, s, ctx, lic.ID, "after-pause", time.Hour, 1)
+	if !errors.Is(err, store.ErrLicenseNotUsable) {
+		t.Fatalf("err = %v, want ErrLicenseNotUsable", err)
+	}
+	n, err := s.CountActiveFloating(ctx, lic.ID)
+	if err != nil || n != 0 {
+		t.Fatalf("active sessions = %d (err %v), want 0", n, err)
 	}
 }
 

@@ -144,6 +144,14 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		IPAddress: in.IPAddress, SeatID: seatID,
 	}
 	if err := s.store.ActivateForKey(ctx, act, max, in.LicenseKey); err != nil {
+		// Usability changed under the lock (a Stripe pause, an expire):
+		// re-read and answer with the same codes assertUsable would.
+		if errors.Is(err, store.ErrLicenseNotUsable) {
+			if fresh, ferr := s.store.FindLicenseByID(ctx, lic.ID); ferr == nil {
+				return nil, s.assertUsable(fresh)
+			}
+			return nil, apperr.New(403, "LICENSE_INVALID", "license is not valid")
+		}
 		// The key was cleared after it was looked up: the member was
 		// removed, or the licence's key changed. Answered as a key
 		// that does not exist, which it now is.
