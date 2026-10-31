@@ -412,15 +412,15 @@ func (s *Store) AcceptSeatInvite(ctx context.Context, plainToken string) (*model
 	// "Foo@x.com" (legacy data, before the AddSeat normalization
 	// landed) should still be matched when invited as "foo@x.com" —
 	// otherwise we'd create a duplicate user and split their
-	// identity. AddSeat now lowercases incoming emails, so the
-	// inserted seat.Email is already canonical.
+	// identity. AddSeat now lowercases incoming emails, but a seat made
+	// before that keeps its capitals, so seat.Email is normalized here.
 	user := new(model.User)
 	// User rows are stored lower-cased (see normalizeEmail), so a plain
 	// comparison is exact and uses users_email_key.
 	err = tx.NewSelect().Model(user).Where("email = ?", normalizeEmail(seat.Email)).Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		user.ID = newID()
-		user.Email = seat.Email
+		user.Email = normalizeEmail(seat.Email)
 		user.Role = model.RoleUser
 		if _, err := tx.NewInsert().Model(user).Exec(ctx); err != nil {
 			return nil, nil, err

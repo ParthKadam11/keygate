@@ -860,6 +860,55 @@ func TestSeats_LegacyMixedCase(t *testing.T) {
 	}
 }
 
+// Accepting a seat made before addresses were lower-cased creates the user
+// lower-cased too: sign-in looks for that address, so a capitalised row would
+// sit beside the account the member signs in to, and a second such invite
+// would miss it and fail on the unique address.
+func TestAcceptSeatInvite_LegacyMixedCase(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, _, licA := perSeatLicense(t, s, ctx, 5, false)
+	_, _, licB := perSeatLicense(t, s, ctx, 5, false)
+	legacy := "Legacy-" + licA.ID + "@Example.com"
+	expires := time.Now().Add(time.Hour)
+
+	accept := func(lic *model.License) *model.User {
+		t.Helper()
+		if _, err := s.DB.NewRaw("INSERT INTO seats (id, license_id, email, role) VALUES (?, ?, ?, 'member')",
+			"legacy-"+lic.ID, lic.ID, legacy).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+		plain, hash := store.GenerateSeatInviteToken()
+		seat := &model.Seat{LicenseID: lic.ID, Email: strings.ToLower(legacy), Role: "member", InviteTokenHash: hash, InviteExpiresAt: &expires}
+		if _, _, err := s.AddSeatWithinLimit(ctx, seat, 0); err != nil {
+			t.Fatalf("renew the legacy invite: %v", err)
+		}
+		user, _, err := s.AcceptSeatInvite(ctx, plain)
+		if err != nil {
+			t.Fatalf("accept the legacy invite: %v", err)
+		}
+		return user
+	}
+
+	first := accept(licA)
+	if first.Email != strings.ToLower(legacy) {
+		t.Errorf("user email = %s, want it lower-cased", first.Email)
+	}
+	if second := accept(licB); second.ID != first.ID {
+		t.Errorf("second invite accepted as user %s, want the first user %s", second.ID, first.ID)
+	}
+
+	// Signing in finds that same account rather than making a second one.
+	if err := s.UpsertUser(ctx, &model.User{Email: legacy, Role: model.RoleUser}); err != nil {
+		t.Fatal(err)
+	}
+	var users int
+	if err := s.DB.NewRaw("SELECT count(*) FROM users WHERE lower(email) = ?", strings.ToLower(legacy)).Scan(ctx, &users); err != nil || users != 1 {
+		t.Errorf("%d users for the address (%v), want 1", users, err)
+	}
+}
+
 // A release of a device that races a member's activate moving it from
 // the shared-key days waits for the move's decision, or the move waits
 // for it: the member never hears "moved" about a device that is gone.
