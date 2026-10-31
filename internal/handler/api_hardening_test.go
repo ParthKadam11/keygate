@@ -438,3 +438,162 @@ func TestSettingsRefuseDeadKeysAndBadBranding(t *testing.T) {
 		}
 	}
 }
+
+// A quota keeps its meter until the caller clears it, as creating
+// another type with one is refused; and a licence "moved" to the plan
+// it is on changes nothing, so nothing is recorded or announced.
+func TestNoOpEditsLeaveNothingBehind(t *testing.T) {
+	f := newAPIFixture(t)
+	h := &AdminHandler{Store: f.s, FeedURLTTL: time.Hour}
+	id := func(v string) gin.Param { return gin.Param{Key: "id", Value: v} }
+
+	code, out := f.call(h.CreateEntitlement, http.MethodPost, "/",
+		`{"plan_id":"`+f.planA.ID+`","feature":"calls","value_type":"quota","value":"100","quota_period":"monthly","stripe_meter_event_name":"api_calls"}`, nil)
+	if code != http.StatusCreated {
+		t.Fatalf("create metered quota = %d %v", code, out)
+	}
+	entID := out["data"].(map[string]any)["id"].(string)
+	// Still metered, a quota does not become another type: usage not yet
+	// sent would go with the meter. Cleared in the same request, it does.
+	if code, out := f.call(h.UpdateEntitlement, http.MethodPut, "/", `{"value_type":"bool","value":"true"}`, nil, id(entID)); code != http.StatusBadRequest {
+		t.Fatalf("metered quota to bool = %d %v, want 400", code, out)
+	}
+	if e, err := f.s.FindEntitlementByID(f.ctx, entID); err != nil || e.ValueType != "quota" || e.StripeMeterEventName != "api_calls" {
+		t.Fatalf("refused change left %+v, %v; want the metered quota", e, err)
+	}
+	if code, out := f.call(h.UpdateEntitlement, http.MethodPut, "/", `{"value_type":"bool","value":"true","stripe_meter_event_name":""}`, nil, id(entID)); code != http.StatusOK {
+		t.Fatalf("quota to bool with the meter cleared = %d %v", code, out)
+	}
+	if e, err := f.s.FindEntitlementByID(f.ctx, entID); err != nil || e.ValueType != "bool" || e.StripeMeterEventName != "" {
+		t.Fatalf("bool entitlement = %+v, %v; want no meter", e, err)
+	}
+
+	// The plan retyped since the licence was issued: the licence keeps
+	// the update period it has, as nothing is written.
+	if _, err := f.s.DB.NewRaw("UPDATE products SET feed_license_required = true WHERE id = ?", f.prodA.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE licenses SET updates_until = now() + interval '30 days' WHERE id = ?", f.licA.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET license_type = 'subscription' WHERE id = ?", f.licA.PlanID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := f.call(h.ChangeLicensePlan, http.MethodPost, "/", `{"plan_id":"`+f.licA.PlanID+`"}`, nil, id(f.licA.ID)); code != http.StatusOK {
+		t.Fatalf("change to the current plan = %d %v, want 200", code, out)
+	}
+	if got, err := f.s.FindLicenseByID(f.ctx, f.licA.ID); err != nil || got.UpdatesUntil == nil {
+		t.Fatalf("licence after a change to its own plan = %+v, %v; want its update period kept", got, err)
+	}
+	time.Sleep(300 * time.Millisecond) // audit lines are written in the background
+	var n int
+	if err := f.s.DB.NewRaw("SELECT count(*) FROM audit_logs WHERE entity_id = ? AND action = 'plan_changed'", f.licA.ID).Scan(f.ctx, &n); err != nil || n != 0 {
+		t.Fatalf("plan_changed audit lines for a change to the current plan = %d, %v; want 0", n, err)
+	}
+}
+
+// An addon taken off sale (active=false) is attached to no further
+// licence, nor enabled again where its attachment was switched off;
+// the licences that have it keep it.
+func TestInactiveAddonKeepsItsLicences(t *testing.T) {
+	f := newAPIFixture(t)
+	h := &AdminHandler{Store: f.s}
+	addon := &model.Addon{ProductID: f.prodA.ID, Name: "Retired", Slug: "retired-" + f.suffix, Feature: "retired",
+		ValueType: "bool", Value: "true", Active: true}
+	if err := f.s.CreateAddon(f.ctx, addon); err != nil {
+		t.Fatal(err)
+	}
+	other := &model.License{ProductID: f.prodA.ID, PlanID: f.planA.ID, Email: "other-addon-" + f.suffix + "@example.com",
+		LicenseKey: "KG-ADDON-OTHER-" + f.suffix, Status: model.StatusActive}
+	switched := &model.License{ProductID: f.prodA.ID, PlanID: f.planA.ID, Email: "switched-addon-" + f.suffix + "@example.com",
+		LicenseKey: "KG-ADDON-SWITCHED-" + f.suffix, Status: model.StatusActive}
+	for _, l := range []*model.License{other, switched} {
+		if err := f.s.CreateLicense(f.ctx, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	post := func(licID string) (int, map[string]any) {
+		return f.call(h.AddLicenseAddon, http.MethodPost, "/", `{"addon_id":"`+addon.ID+`"}`, nil, gin.Param{Key: "id", Value: licID})
+	}
+	for _, l := range []*model.License{f.licA, switched} {
+		if code, out := post(l.ID); code != http.StatusCreated {
+			t.Fatalf("attach while offered = %d %v", code, out)
+		}
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE license_addons SET enabled = false WHERE license_id = ?", switched.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.DB.NewRaw("UPDATE addons SET active = false WHERE id = ?", addon.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, out := post(other.ID); code != http.StatusConflict || errCode(out) != "ADDON_INACTIVE" {
+		t.Errorf("attach once off sale = %d %v, want 409 ADDON_INACTIVE", code, out)
+	}
+	if code, out := post(switched.ID); code != http.StatusConflict || errCode(out) != "ADDON_INACTIVE" {
+		t.Errorf("enable again once off sale = %d %v, want 409 ADDON_INACTIVE", code, out)
+	}
+	if code, out := post(f.licA.ID); code != http.StatusOK {
+		t.Errorf("asking again for a licence that has it = %d %v, want 200", code, out)
+	}
+	for lic, want := range map[*model.License]int{f.licA: 1, switched: 0, other: 0} {
+		addons, _, err := f.s.ListLicenseAddons(f.ctx, lic.ID, store.All)
+		if err != nil || len(addons) != want {
+			t.Errorf("enabled attachments of %s = %d (%v), want %d", lic.Email, len(addons), err, want)
+		}
+	}
+}
+
+// Reinstating lifts a suspension and nothing else. A licence whose
+// expiry and grace ran out meanwhile still does not work, and the
+// answer says so and what brings it back, rather than reading "active"
+// alone.
+func TestReinstateSaysWhenTheLicenceLapsedMeanwhile(t *testing.T) {
+	f := newAPIFixture(t)
+	h := &AdminHandler{Store: f.s}
+	reinstate := func(lic *model.License, validUntil string) map[string]any {
+		t.Helper()
+		if _, err := f.s.DB.NewRaw("UPDATE licenses SET status = 'suspended', valid_until = "+validUntil+" WHERE id = ?", lic.ID).Exec(f.ctx); err != nil {
+			t.Fatal(err)
+		}
+		code, out := f.call(h.ReinstateLicense, http.MethodPost, "/", "", nil, gin.Param{Key: "id", Value: lic.ID})
+		if code != http.StatusOK {
+			t.Fatalf("reinstate = %d %v", code, out)
+		}
+		return out["data"].(map[string]any)
+	}
+	if d := reinstate(f.licA, "now() - interval '60 days'"); d["usable"] != false || d["notice"] == nil {
+		t.Errorf("reinstating a licence that lapsed while suspended = %v, want usable false with a notice", d)
+	}
+	if d := reinstate(f.licB, "now() + interval '30 days'"); d["usable"] != true || d["notice"] != nil {
+		t.Errorf("reinstating a licence within its term = %v, want usable true", d)
+	}
+}
+
+// The seats a licence holds travel with it in both export formats.
+func TestExportCarriesQuantity(t *testing.T) {
+	f := newAPIFixture(t)
+	h := &AdminHandler{Store: f.s}
+	if _, err := f.s.DB.NewRaw("UPDATE licenses SET quantity = 7 WHERE id = ?", f.licA.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	export := func(format string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/admin/licenses/export?format="+format+"&product_id="+f.prodA.ID, nil)
+		h.ExportLicenses(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s export = %d: %s", format, w.Code, w.Body.String())
+		}
+		return w.Body.String()
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(export("json")), &rows); err != nil || len(rows) == 0 || rows[0]["quantity"] != float64(7) {
+		t.Fatalf("json export = %v, %v; want quantity 7", rows, err)
+	}
+	lines := strings.Split(strings.TrimSpace(export("csv")), "\n")
+	if !strings.HasSuffix(lines[0], ",quantity") || len(lines) < 2 || !strings.HasSuffix(strings.TrimSpace(lines[1]), ",7") {
+		t.Fatalf("csv export = %q, want a quantity column last holding 7", lines)
+	}
+}

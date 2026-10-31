@@ -155,25 +155,38 @@ func TestRenderSparkleOmitsInvalidSignature(t *testing.T) {
 	}
 }
 
-func TestSanitizeCDATAEscapesEndMarker(t *testing.T) {
-	notes := "before ]]> middle ]]> after"
-	in := FeedInput{
-		ProductName: "X",
-		Releases: []*FeedRelease{
-			mkRelease("1.0.0", func(r *model.Release, _ *model.ReleaseArtifact) { r.ReleaseNotes = notes }),
-		},
-	}
-	body, err := RenderSparkle(in)
-	if err != nil {
-		t.Fatalf("RenderSparkle: %v", err)
-	}
-	if strings.Contains(string(body), "<![CDATA[before ]]>") {
-		t.Errorf("CDATA terminator was not escaped; output:\n%s", string(body))
-	}
-	// Round-trip should still parse despite the embedded ]]>
-	var rt sparkleAppcast
-	if err := xml.Unmarshal(body, &rt); err != nil {
-		t.Fatalf("sparkle XML parse failed: %v", err)
+// Release notes reach Sparkle as written: a "]]>" in them stays inside
+// the description (split once, by encoding/xml, not twice), and
+// characters XML cannot carry are dropped instead of making the whole
+// appcast unparseable.
+func TestRenderSparkleNotes(t *testing.T) {
+	for _, tc := range []struct{ notes, want string }{
+		{"before ]]> middle ]]> after", "before ]]> middle ]]> after"},
+		{"fixes: a[i]]> b", "fixes: a[i]]> b"},
+		{"\x1b[32mAdded\x1b[0m dark mode", "[32mAdded[0m dark mode"},
+		{"tab\there\nnew line\x00\x07 bell", "tab\there\nnew line bell"},
+		{"bad utf-8 \xff\xfe here", "bad utf-8  here"},
+		{"中文说明 ✓", "中文说明 ✓"},
+	} {
+		in := FeedInput{
+			ProductName: "X",
+			Releases: []*FeedRelease{
+				mkRelease("1.0.0", func(r *model.Release, _ *model.ReleaseArtifact) { r.ReleaseNotes = tc.notes }),
+			},
+		}
+		body, err := RenderSparkle(in)
+		if err != nil {
+			t.Fatalf("%q: RenderSparkle: %v", tc.notes, err)
+		}
+		var rt struct {
+			Notes []string `xml:"channel>item>description"`
+		}
+		if err := xml.Unmarshal(body, &rt); err != nil {
+			t.Fatalf("%q: sparkle XML parse failed: %v\n%s", tc.notes, err, body)
+		}
+		if len(rt.Notes) != 1 || rt.Notes[0] != tc.want {
+			t.Errorf("%q: the description reads %q, want %q", tc.notes, rt.Notes, tc.want)
+		}
 	}
 }
 

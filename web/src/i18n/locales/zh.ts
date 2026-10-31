@@ -35,7 +35,7 @@ const zh = {
   "acceptInvite.acceptedTitle": "欢迎加入 {product}",
   "acceptInvite.acceptedTitleNoProduct": "邀请已接受",
   "acceptInvite.acceptedDesc": "你已获得这个许可证的使用权限。打开门户即可获取你自己的许可证密钥。",
-  "acceptInvite.openPortal": "打开 portal",
+  "acceptInvite.openPortal": "打开用户门户",
   "acceptInvite.goHome": "返回首页",
   "common.actions": "操作",
   "common.status": "状态",
@@ -740,6 +740,8 @@ const zh = {
   "portal.planInactive": "该方案已停售，请选择其他方案。",
   "portal.inviteDuringUpgrade":
     "这个许可证在一小时内打开过升级结账页。付款完成后，或结账页在一小时内失效后，即可继续邀请新成员。",
+  "portal.inviteUpgradeSeatLimit":
+    "这个许可证有一个升级结账页尚未完成，升级后的方案已经没有空余席位，无法再邀请新成员。",
   "portal.inviteSeatLimit": "这个许可证的席位已用完，暂时无法邀请新成员。",
   "portal.downgradeNotSupported":
     "这项变更会降低一部分额度、同时提高另一部分，或者价格更高、计费周期不同，无法在这里完成。请联系卖家。",
@@ -924,6 +926,9 @@ const zh = {
   // Licenses refund
   "licenses.refund": "取消订阅并吊销",
   "licenses.updatesUntil": "更新至",
+  "licenses.maintenanceDisabled": "维护期功能尚未启用。请在所有服务器都升级到这个版本后，到设置中开启。",
+  "licenses.reinstatedLapsed": "已恢复，但它的到期日在暂停期间已过，目前仍不可用。请设置新的到期日。",
+  "licenses.reinstatedLapsedStripe": "已恢复，但它的到期日在暂停期间已过，Stripe 订阅付款后才会恢复可用。",
   "licenses.updatesUntilEdit": "编辑更新期",
   "licenses.updatesUntilClear": "留空表示永久更新。",
 

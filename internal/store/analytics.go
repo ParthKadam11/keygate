@@ -468,6 +468,33 @@ func (s *Store) TakeSnapshot(ctx context.Context, productID string, date time.Ti
 	return s.CreateAnalyticsSnapshot(ctx, snap)
 }
 
+// TakeMissingSnapshots takes the snapshot of date for every product that
+// has none for it yet, and leaves the ones taken alone. Run at start and
+// every hour, it gives each day its snapshot however often the server
+// restarts: a wait of 24 hours from start, restarted by every restart,
+// never came round on a server restarted more than once a day.
+func (s *Store) TakeMissingSnapshots(ctx context.Context, date time.Time) error {
+	products, _, err := s.ListProducts(ctx, "", nil, All)
+	if err != nil {
+		return err
+	}
+	day := date.Truncate(24 * time.Hour)
+	for _, p := range products {
+		taken, err := s.DB.NewSelect().Model((*model.AnalyticsSnapshot)(nil)).
+			Where("product_id = ? AND date = ?", p.ID, day).Exists(ctx)
+		if err != nil {
+			return err
+		}
+		if taken {
+			continue
+		}
+		if err := s.TakeSnapshot(ctx, p.ID, date); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) TakeAllSnapshots(ctx context.Context, date time.Time) error {
 	products, _, err := s.ListProducts(ctx, "", nil, All)
 	if err != nil {
@@ -639,7 +666,9 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 	q := s.DB.NewSelect().
 		TableExpr("licenses AS l").
 		ColumnExpr("min(l.email) AS email").
-		ColumnExpr("COALESCE(l.user_id, '') AS user_id").
+		// The account, when one of the customer's licences is linked to
+		// it: one row per customer, by email, as GetUserDetail takes them.
+		ColumnExpr("COALESCE(max(l.user_id), '') AS user_id").
 		ColumnExpr("COUNT(DISTINCT l.id)::int AS license_count").
 		ColumnExpr("COUNT(DISTINCT l.id) FILTER (WHERE l.status = 'active')::int AS active_count").
 		ColumnExpr("COALESCE(SUM(uc.total_usage), 0) AS total_usage").
@@ -650,9 +679,12 @@ func (s *Store) GetTopUsers(ctx context.Context, productID string, limit int) ([
 		Join("LEFT JOIN (SELECT license_id, SUM(quantity) AS total_usage FROM usage_events GROUP BY license_id) uc ON uc.license_id = l.id").
 		Join("LEFT JOIN (SELECT license_id, COUNT(*) AS activations FROM activations GROUP BY license_id) ac ON ac.license_id = l.id").
 		// Exclude admin users from customer rankings
-		Where("lower(l.email) NOT IN (SELECT email FROM users WHERE role IN ('owner', 'admin'))").
-		GroupExpr("lower(l.email), l.user_id").
-		OrderExpr("license_count DESC, total_usage DESC").
+		// Compared lower-cased on both sides (an address stored in mixed
+		// case is the same person); NOT EXISTS, as NOT IN over a set
+		// holding a NULL excludes every row.
+		Where("NOT EXISTS (SELECT 1 FROM users u WHERE u.role IN ('owner', 'admin') AND lower(u.email) = lower(l.email))").
+		GroupExpr("lower(l.email)").
+		OrderExpr("license_count DESC, total_usage DESC, lower(l.email) ASC").
 		Limit(limit)
 	if productID != "" {
 		q = q.Where("l.product_id = ?", productID)

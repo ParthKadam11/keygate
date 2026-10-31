@@ -115,6 +115,13 @@ func (s *FloatingService) Heartbeat(ctx context.Context, licenseKey, identifier,
 	if err != nil {
 		return nil, err
 	}
+	// As CheckOut: a session renews only on a floating plan. One taken
+	// out before the licence moved to a standard plan would otherwise run
+	// on beside the devices that plan now counts, a seat on two machines.
+	// It ends at its expiry; the machine activates instead.
+	if lic.Plan == nil || lic.Plan.LicenseModel != "floating" {
+		return nil, licenseNotFound()
+	}
 
 	timeout := 30
 	if lic.Plan != nil && lic.Plan.FloatingTimeout > 0 {

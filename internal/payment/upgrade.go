@@ -279,10 +279,11 @@ func (h *StripeHandler) StartUpgrade(c *gin.Context) {
 			CancelURL:           stripe.String(h.BaseURL + "/portal"),
 			AllowPromotionCodes: stripe.Bool(true),
 		}
-		if plan.PerSeat {
-			// Nobody new is invited while it is open (see
-			// store.ErrUpgradeCheckoutOpen): an abandoned one lapses soon.
-			params.ExpiresAt = stripe.Int64(time.Now().Add(store.PerSeatUpgradeCheckoutTTL).Unix())
+		if plan.PerSeat || plan.MaxSeats > 0 {
+			// Invites are held to what it was opened for while it is
+			// open (see store.ErrUpgradeCheckoutOpen): an abandoned one
+			// lapses soon, and none is paid after the hold has ended.
+			params.ExpiresAt = stripe.Int64(time.Now().Add(store.UpgradeCheckoutTTL).Unix())
 		}
 		if now.StripeCustomerID != "" {
 			params.Customer = stripe.String(now.StripeCustomerID)
@@ -590,11 +591,11 @@ func (h *StripeHandler) fulfillUpgrade(ctx context.Context, customerID, subscrip
 			cols = append(cols, "stripe_synced_at")
 		}
 		// The seats bought were counted from the people on the licence
-		// when the checkout opened, and nobody joins while it is open (see
-		// store.ErrUpgradeCheckoutOpen). Should there be more people all the
-		// same (an operator added one), the upgrade still applies, as paid:
-		// a licence over its seats keeps everyone, takes nobody new, and
-		// the owner adds seats or frees them.
+		// when the checkout opened, and the team stays within them while
+		// it is open (see store.ErrUpgradeCheckoutOpen). Should there be
+		// more people all the same (an operator added one), the upgrade
+		// still applies, as paid: a licence over its seats keeps everyone,
+		// takes nobody new, and the owner adds seats or frees them.
 		update := store.UpdateLicenseIn
 		if locked.UpdatesUntil != nil {
 			// The old period's renewals belong to a period this licence
@@ -870,9 +871,13 @@ func (h *StripeHandler) EndPastDueUpgrade(ctx context.Context, lic *model.Licens
 }
 
 // EndGraceExpiredUpgrade is the grace sweep's hook, for a licence whose
-// valid_until is before cutoff (see endLapsedUpgrade).
-func (h *StripeHandler) EndGraceExpiredUpgrade(ctx context.Context, lic *model.License, cutoff time.Time) (bool, error) {
+// grace has run out (see endLapsedUpgrade). The sweep's cutoff is from
+// the plan as it read it; the licence read again is judged by its plan
+// as it is now, as the sweep's own write is (Store.ExpireLicenseAfterGrace),
+// so grace raised meanwhile keeps it.
+func (h *StripeHandler) EndGraceExpiredUpgrade(ctx context.Context, lic *model.License, _ time.Time) (bool, error) {
 	return h.endLapsedUpgrade(ctx, lic, upgradeEndGrace, func(l *model.License) bool {
+		cutoff := time.Now().Add(-time.Duration(l.GraceDays()) * 24 * time.Hour)
 		return (l.Status == model.StatusActive || l.Status == model.StatusPastDue) &&
 			l.ValidUntil != nil && l.ValidUntil.Before(cutoff)
 	})

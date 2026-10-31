@@ -3708,6 +3708,17 @@ paths:
                       status:
                         type: string
                         description: The status the license now has
+                      usable:
+                        type: boolean
+                        description: |
+                          Whether the license works now. A suspended license whose
+                          expiry and grace ran out while it was suspended is
+                          reinstated but still does not work: the next expiry check
+                          expires it (or returns an upgraded one to its free plan).
+                          Absent when the license could not be read back.
+                      notice:
+                        type: string
+                        description: When `usable` is false, what brings the license back
         "400":
           description: "`BAD_REQUEST`: the license cannot be reinstated from its current status"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -4370,6 +4381,12 @@ paths:
         the existing attachment with 200; a new attachment returns 201.
         An enabled add-on's feature replaces the plan's entitlement for
         the same feature.
+
+        An add-on with `active: false` is taken off sale: it is attached
+        to no further license (409 `ADDON_INACTIVE`), nor enabled again
+        where its attachment was switched off, while the licenses that
+        already have it keep it. To take its feature from those, detach
+        it from each.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []
@@ -4415,6 +4432,9 @@ paths:
           $ref: "#/components/responses/AdminForbidden"
         "404":
           description: "`NOT_FOUND`: license or add-on not found"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: "`ADDON_INACTIVE`: the add-on is no longer offered (`active: false`) and the license does not have it"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "429":
           $ref: "#/components/responses/RateLimited"
@@ -4561,6 +4581,18 @@ paths:
                           releases:
                             type: array
                             items: { $ref: "#/components/schemas/Release" }
+                          latest_published:
+                            type: array
+                            description: |
+                              The highest published version (by semver) of each product
+                              and channel, whatever the channel, status and page
+                              asked for; only the product_id filter applies.
+                            items:
+                              type: object
+                              properties:
+                                product_id: { type: string, format: uuid }
+                                channel: { type: string }
+                                version: { type: string }
         "400":
           description: "`BAD_REQUEST`: invalid channel or status"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -5096,7 +5128,7 @@ paths:
         "404":
           $ref: "#/components/responses/AdminReleaseNotFound"
         "409":
-          description: "`NOT_UNYANKABLE`: only yanked releases can be restored"
+          description: "`NOT_UNYANKABLE`: only yanked releases can be restored, and only while the product's type has releases"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "429":
           $ref: "#/components/responses/RateLimited"
@@ -6877,7 +6909,9 @@ components:
             value: { type: string }
             quota_period: { type: string }
             quota_unit: { type: string }
-            active: { type: boolean }
+            active:
+              type: boolean
+              description: Whether the add-on is still offered; one that is not is attached to no further license, and licenses that have it keep it
 
     FloatingSession:
       type: object

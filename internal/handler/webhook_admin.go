@@ -85,6 +85,11 @@ func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
 		Active:    true,
 	}
 	if err := h.Store.CreateWebhook(c, w); err != nil {
+		if store.IsForeignKeyViolation(err) {
+			// The product was deleted after it was checked.
+			response.NotFound(c, "product not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -133,16 +138,26 @@ func (h *WebhookAdminHandler) UpdateWebhook(c *gin.Context) {
 		}
 		w.URL = *req.URL
 	}
+	var columns []string
+	if req.URL != nil {
+		columns = append(columns, "url")
+	}
 	if req.Events != nil {
 		if !validWebhookEvents(c, req.Events) {
 			return
 		}
 		w.Events = req.Events
+		columns = append(columns, "events")
 	}
 	if req.Active != nil {
 		w.Active = *req.Active
+		columns = append(columns, "active")
 	}
-	if err := h.Store.UpdateWebhook(c, w); err != nil {
+	if err := h.Store.UpdateWebhook(c, w, columns...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "webhook not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -276,7 +291,9 @@ func (h *WebhookAdminHandler) ResendDelivery(c *gin.Context) {
 	}
 	fresh, err := h.Webhook.Redispatch(c, deliveryID)
 	if err != nil {
-		if err == service.ErrWebhookDeliveryNotResendable {
+		// Deleted between the check in Redispatch and the new delivery's
+		// insert: the same answer as deleted before it.
+		if err == service.ErrWebhookDeliveryNotResendable || store.IsForeignKeyViolation(err) {
 			response.Err(c, 409, "NOT_RESENDABLE",
 				"webhook is deleted or inactive — re-enable it before resending")
 			return
@@ -305,6 +322,11 @@ func (h *WebhookAdminHandler) TestWebhook(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, service.ErrWebhookInactive) {
 			response.Err(c, http.StatusConflict, "WEBHOOK_INACTIVE", "enable the webhook before testing it")
+			return
+		}
+		if store.IsForeignKeyViolation(err) {
+			// Deleted while the test was being sent.
+			response.NotFound(c, "webhook not found")
 			return
 		}
 		response.Internal(c, err)

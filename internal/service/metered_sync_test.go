@@ -321,3 +321,95 @@ func TestMeteredSync_DeadRowsDoNotStarveTheBatch(t *testing.T) {
 		t.Fatalf("limit 2 with 2 dead rows ahead: pushed %d, want 1 (the live row)", pushed)
 	}
 }
+
+// Passes running at once on several replicas push each row once and
+// count one attempt for it, not one per replica: one runs, the others
+// find it running and leave the rows to it.
+func TestMeteredSync_OnePassAtATime(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	lic, _ := seedMeteredLicense(t, tt.store, ctx, "ev_once", "cus_once")
+	for range 5 {
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-05", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held := make(chan struct{})
+	unblock := make(chan struct{})
+	var once sync.Once
+	tt.syncer.dispatch = func(ctx context.Context, in stripeMeterEvent) (string, error) {
+		once.Do(func() { close(held); <-unblock })
+		return tt.dispatch(ctx, in)
+	}
+	done := make(chan int, 1)
+	go func() { done <- tt.syncer.RunOnce(ctx, 10) }()
+	<-held // the first pass is pushing, and holds the lock
+	other := &MeteredBillingSyncer{store: tt.store, logger: tt.syncer.logger, dispatch: tt.dispatch, maxAttempts: 3}
+	if pushed := other.RunOnce(ctx, 10); pushed != 0 {
+		t.Errorf("a second pass while the first runs pushed %d, want 0", pushed)
+	}
+	close(unblock)
+	if pushed := <-done; pushed != 5 {
+		t.Errorf("the first pass pushed %d, want 5", pushed)
+	}
+	if len(tt.captured) != 5 {
+		t.Errorf("Stripe saw %d events, want each of the 5 once", len(tt.captured))
+	}
+	var attempts int
+	if err := tt.store.DB.NewRaw("SELECT coalesce(sum(attempts), 0) FROM metered_billing WHERE license_id = ?", lic.ID).Scan(ctx, &attempts); err != nil || attempts > 5 {
+		t.Errorf("attempts = %d, %v; want at most one per row", attempts, err)
+	}
+	// Released: the next pass runs.
+	if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-05", 1); err != nil {
+		t.Fatal(err)
+	}
+	if pushed := other.RunOnce(ctx, 10); pushed != 1 {
+		t.Errorf("a pass after the first finished pushed %d, want 1", pushed)
+	}
+}
+
+// A pass sends the whole queue, a batch at a time, not one batch; and a
+// row that fails is tried once in the pass, not again for every batch.
+func TestMeteredSync_SendsTheWholeQueue(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	lic, _ := seedMeteredLicense(t, tt.store, ctx, "ev_all", "cus_all")
+	for range 25 {
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-05", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tt.failNext = errors.New("stripe: temporary")
+	if pushed := tt.syncer.RunOnce(ctx, 10); pushed != 24 {
+		t.Fatalf("pushed %d in one pass of batches of 10, want the 24 that did not fail", pushed)
+	}
+	var waiting, attempts int
+	if err := tt.store.DB.NewRaw("SELECT count(*), coalesce(sum(attempts), 0) FROM metered_billing WHERE license_id = ? AND synced = false", lic.ID).Scan(ctx, &waiting, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if waiting != 1 || attempts != 1 {
+		t.Fatalf("waiting rows = %d with %d attempts, want the one that failed, tried once", waiting, attempts)
+	}
+	if pushed := tt.syncer.RunOnce(ctx, 10); pushed != 1 {
+		t.Fatalf("the next pass pushed %d, want the one left", pushed)
+	}
+}
+
+// Stripe failing every push ends the pass after a run of failures, not
+// at the end of the queue: the rest waits for the next pass.
+func TestMeteredSync_RunOfFailuresEndsThePass(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	lic, _ := seedMeteredLicense(t, tt.store, ctx, "ev_down", "cus_down")
+	for range 30 {
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-05", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tries := 0
+	tt.syncer.dispatch = func(context.Context, stripeMeterEvent) (string, error) {
+		tries++
+		return "", errors.New("stripe: unreachable")
+	}
+	tt.syncer.RunOnce(ctx, 5)
+	if tries != meteredFailuresEndPass {
+		t.Fatalf("pushes tried with Stripe down = %d, want the pass to end after %d", tries, meteredFailuresEndPass)
+	}
+}

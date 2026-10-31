@@ -46,18 +46,26 @@ func HashSeatInviteToken(plain string) string {
 }
 
 // ErrUpgradeCheckoutOpen is returned by AddSeatWithinLimit while a
-// checkout for upgrading the licence to a plan sold per seat is open:
-// its seats were counted from the people on the licence when it opened,
-// so nobody joins until it is paid or closed.
+// checkout upgrading the licence to a plan sold per seat is open: its
+// seats were counted from the people on the licence when it opened, so
+// nobody joins until it is paid or closed.
 var ErrUpgradeCheckoutOpen = errors.New("an upgrade checkout is open")
 
-// PerSeatUpgradeCheckoutTTL is how long a checkout upgrading a licence
-// to a plan sold per seat can be paid (its expires_at); an abandoned one
-// holds invites up no longer. upgradeCheckoutOpenFor adds a margin for
-// the moments between the upgrade row and the checkout being created.
+// ErrUpgradeSeatLimit is returned by AddSeatWithinLimit while a
+// checkout upgrading the licence to a plan with a seat limit is open
+// and the team already fills that limit: the team was checked against
+// it when the checkout opened, so it grows only as far as that limit
+// meanwhile. Unlike ErrUpgradeCheckoutOpen, paying does not make room.
+var ErrUpgradeSeatLimit = errors.New("the plan being upgraded to has no seat left")
+
+// UpgradeCheckoutTTL is how long a checkout upgrading a licence to a
+// plan sold per seat or with a seat limit can be paid (its expires_at);
+// an abandoned one holds invites up no longer. upgradeCheckoutOpenFor
+// adds a margin for the moments between the upgrade row and the
+// checkout being created.
 const (
-	PerSeatUpgradeCheckoutTTL = time.Hour
-	upgradeCheckoutOpenFor    = PerSeatUpgradeCheckoutTTL + 5*time.Minute
+	UpgradeCheckoutTTL     = time.Hour
+	upgradeCheckoutOpenFor = UpgradeCheckoutTTL + 5*time.Minute
 )
 
 // UpgradeLockKey names the advisory lock StartUpgrade holds per licence
@@ -175,16 +183,20 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		}
 		// Pending re-invite (the invite sent again) → rotate token,
 		// refresh expiry and invited_at, and take the invite's role
-		// (member). user_id / accepted_at remain NULL. Postgres keeps
-		// microseconds, so the seat returned matches the one read back.
-		now := time.Now().Truncate(time.Microsecond)
-		if _, err := tx.NewUpdate().Model((*model.Seat)(nil)).
+		// (member). user_id / accepted_at remain NULL. invited_at is the
+		// database's clock, as the first invite's was (its default): this
+		// server's may be behind it, and the invite sent again would
+		// read as sent before the first. It is read back, so the seat
+		// returned matches the one stored.
+		var now time.Time
+		if err := tx.NewUpdate().Model((*model.Seat)(nil)).
 			Set("role = ?", seat.Role).
 			Set("invite_token_hash = ?", seat.InviteTokenHash).
 			Set("invite_expires_at = ?", seat.InviteExpiresAt).
-			Set("invited_at = ?", now).
+			Set("invited_at = now()").
 			Where("id = ?", existing.ID).
-			Exec(ctx); err != nil {
+			Returning("invited_at").
+			Scan(ctx, &now); err != nil {
 			return "", nil, err
 		}
 		existing.InvitedAt = now
@@ -198,27 +210,35 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		return "", nil, err
 	}
 
-	// Someone joining, not an invite sent again: not while a checkout
-	// for a plan sold per seat is open (see ErrUpgradeCheckoutOpen).
-	var upgrading bool
-	if err := tx.NewRaw(`SELECT EXISTS (SELECT 1 FROM license_upgrades u JOIN plans p ON p.id = u.to_plan_id
-		WHERE u.license_id = ? AND u.state = ? AND p.per_seat AND u.created_at > now() - make_interval(secs => ?))`,
-		seat.LicenseID, model.UpgradePending, upgradeCheckoutOpenFor.Seconds()).Scan(ctx, &upgrading); err != nil {
+	// Someone joining, not an invite sent again, while an upgrade
+	// checkout is open: not at all for a plan sold per seat (see
+	// ErrUpgradeCheckoutOpen), and only within the seat limit of any
+	// other (see ErrUpgradeSeatLimit).
+	// A limit of 0 is none.
+	var perSeat sql.NullBool
+	var upgradeLimit sql.NullInt64
+	if err := tx.NewRaw(`SELECT bool_or(p.per_seat), min(NULLIF(p.max_seats, 0))
+		FROM license_upgrades u JOIN plans p ON p.id = u.to_plan_id
+		WHERE u.license_id = ? AND u.state = ? AND u.created_at > now() - make_interval(secs => ?)`,
+		seat.LicenseID, model.UpgradePending, upgradeCheckoutOpenFor.Seconds()).Scan(ctx, &perSeat, &upgradeLimit); err != nil {
 		return "", nil, err
 	}
-	if upgrading {
+	if perSeat.Bool {
 		return "", nil, ErrUpgradeCheckoutOpen
 	}
 
 	// Capacity check — the members (see memberSeatsSQL), plus one for
 	// the owner, who holds a seat without a row.
-	if maxSeats > 0 {
+	if maxSeats > 0 || upgradeLimit.Int64 > 0 {
 		var count int
 		if err := tx.NewRaw(memberSeatsSQL, seat.LicenseID).Scan(ctx, &count); err != nil {
 			return "", nil, err
 		}
-		if count+1 >= maxSeats {
+		if maxSeats > 0 && count+1 >= maxSeats {
 			return "", nil, ErrSeatLimitReached
+		}
+		if upgradeLimit.Int64 > 0 && int64(count+1) >= upgradeLimit.Int64 {
+			return "", nil, ErrUpgradeSeatLimit
 		}
 	}
 
@@ -250,7 +270,6 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		// last time on the team: RemoveSeat clears them, but a seat
 		// removed by an older version (during a rolling upgrade) kept
 		// them, and coming back must not bring that key back to life.
-		now := time.Now().Truncate(time.Microsecond)
 		var stale []*model.Activation
 		if err := tx.NewRaw("DELETE FROM activations WHERE seat_id = ? RETURNING *", removed.ID).Scan(ctx, &stale); err != nil {
 			return "", nil, err
@@ -258,7 +277,7 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 		if _, err := tx.NewRaw("DELETE FROM floating_sessions WHERE seat_id = ?", removed.ID).Exec(ctx); err != nil {
 			return "", nil, err
 		}
-		if _, err := tx.NewUpdate().Model((*model.Seat)(nil)).
+		if err := tx.NewUpdate().Model((*model.Seat)(nil)).
 			Set("removed_at = NULL").
 			Set("user_id = NULL").
 			Set("accepted_at = NULL").
@@ -268,12 +287,13 @@ func (s *Store) AddSeatWithinLimit(ctx context.Context, seat *model.Seat, maxSea
 			Set("role = ?", seat.Role).
 			Set("invite_token_hash = ?", seat.InviteTokenHash).
 			Set("invite_expires_at = ?", seat.InviteExpiresAt).
-			Set("invited_at = ?", now).
+			// The database's clock, as for an invite sent again above.
+			Set("invited_at = now()").
 			Where("id = ?", removed.ID).
-			Exec(ctx); err != nil {
+			Returning("invited_at").
+			Scan(ctx, &removed.InvitedAt); err != nil {
 			return "", nil, err
 		}
-		removed.InvitedAt = now
 		removed.RemovedAt = nil
 		removed.UserID = ""
 		removed.MemberKey, removed.MemberKeyHash, removed.MemberKeyEncrypted = "", "", nil

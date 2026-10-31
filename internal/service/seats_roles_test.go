@@ -135,6 +135,21 @@ func TestSeatManagementIsTheOwners(t *testing.T) {
 		if err != nil || emails(seats) != want {
 			t.Fatalf("team as %s sees it = %s, %v; want %s", actor, emails(seats), err, want)
 		}
+		// The accounts behind the seats are the admin's to see.
+		for _, st := range seats {
+			if st.UserID != "" {
+				t.Errorf("team as %s shows %s's account %s", actor, st.Email, st.UserID)
+			}
+		}
+	}
+	var linked int
+	if err := s.DB.NewRaw("SELECT count(*) FROM seats WHERE license_id = ? AND user_id IS NOT NULL", lic.ID).Scan(ctx, &linked); err != nil || linked == 0 {
+		t.Fatalf("seats linked to an account = %d, %v; want some, or the check above proves nothing", linked, err)
+	}
+	// Inviting someone who has joined hands back their seat, without it.
+	again, err := svc.AddSeat(ctx, AddSeatInput{LicenseKey: lic.LicenseKey, Email: alice.Email, ActorEmail: lic.Email})
+	if err != nil || again.ID != alice.ID || again.UserID != "" {
+		t.Fatalf("alice invited again = %+v, %v; want her seat without her account", again, err)
 	}
 	hank, err := s.FindSeatByEmail(ctx, lic.ID, email("hank"))
 	if err != nil {

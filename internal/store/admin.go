@@ -147,6 +147,13 @@ func (s *Store) DeleteProduct(ctx context.Context, id string) error {
 				return err
 			}
 		}
+		// The releases first, as a publish takes them before the signing
+		// key: the delete's cascade reaches the product's signing keys
+		// before its restrict check locks the releases, and a publish
+		// holding a release and waiting on its key would deadlock it.
+		if _, err := tx.NewRaw("SELECT 1 FROM releases WHERE product_id = ? FOR KEY SHARE", id).Exec(ctx); err != nil {
+			return err
+		}
 		return deletedOne(tx.NewDelete().Model((*model.Product)(nil)).Where("id = ?", id).Exec(ctx))
 	})
 }
@@ -273,12 +280,18 @@ func (s *Store) DeletePlan(ctx context.Context, id string) error {
 //     license_model='floating' is a conflict
 //   - if newType doesn't support seats → max_seats>0 is a conflict
 func (s *Store) CountPlansIncompatibleWithType(ctx context.Context, productID, newType string) (int, error) {
+	return CountPlansIncompatibleWithTypeIn(ctx, s.DB, productID, newType)
+}
+
+// CountPlansIncompatibleWithTypeIn is CountPlansIncompatibleWithType
+// inside a transaction.
+func CountPlansIncompatibleWithTypeIn(ctx context.Context, db bun.IDB, productID, newType string) (int, error) {
 	supportsAct := model.ProductSupports(newType, model.CapActivations)
 	supportsSeats := model.ProductSupports(newType, model.CapSeats)
 	if supportsAct && supportsSeats {
 		return 0, nil
 	}
-	q := s.DB.NewSelect().Model((*model.Plan)(nil)).Where("product_id = ?", productID)
+	q := db.NewSelect().Model((*model.Plan)(nil)).Where("product_id = ?", productID)
 	switch {
 	// A plan sold per seat sets no max_seats of its own: the 1 it keeps
 	// there moves with the product's type (see UpdateProductIn).
@@ -380,15 +393,16 @@ func (s *Store) FindAPIKeyByID(ctx context.Context, id string) (*model.APIKey, e
 // scopes, and product binding are preserved so callers can update
 // their config without re-registering the key. last_used/last_used_ip
 // are reset since the previous physical secret is no longer valid.
+// RotateAPIKey gives a key a new secret; sql.ErrNoRows when the key was
+// deleted meanwhile, so no secret is handed out that opens nothing.
 func (s *Store) RotateAPIKey(ctx context.Context, id, rawKey, prefix string) error {
-	_, err := s.DB.NewUpdate().Model((*model.APIKey)(nil)).
+	return deletedOne(s.DB.NewUpdate().Model((*model.APIKey)(nil)).
 		Set("key_hash = ?", HashAPIKey(rawKey)).
 		Set("prefix = ?", prefix).
 		Set("last_used = NULL").
 		Set("last_used_ip = ''").
 		Where("id = ?", id).
-		Exec(ctx)
-	return err
+		Exec(ctx))
 }
 
 // GenerateRawAPIKey creates a raw API key string like "kg_live_xxxxxxxx..."
@@ -481,6 +495,9 @@ func (s *Store) SuspendLicense(ctx context.Context, id string) error {
 				return ErrLicenseNotSuspendable
 			}
 			return ErrLicenseNotFound
+		}
+		if err := endFloatingSessionsIfStoppedIn(ctx, tx, id, model.StatusSuspended); err != nil {
+			return err
 		}
 		return syncSubscriptionStatus(ctx, tx, id, model.StatusSuspended)
 	})
@@ -688,6 +705,20 @@ func (s *Store) ExpireLicenseIf(ctx context.Context, id string, statuses []strin
 	})
 }
 
+// ExpireLicenseAfterGrace marks an active or past-due licence expired
+// while its grace has run out by its plan as it is now (7 days without
+// one, as License.GraceDays). The grace sweep reads a plan's grace days
+// with the licence; an admin who raises them, or moves the licence to
+// another plan, during the sweep would otherwise see licences still in
+// their new grace expired, and their devices cleared.
+func (s *Store) ExpireLicenseAfterGrace(ctx context.Context, id string) (ok bool, err error) {
+	return s.expireLicenseWhere(ctx, id, func(q *bun.UpdateQuery) *bun.UpdateQuery {
+		return q.Where("status IN (?)", bun.List([]string{model.StatusActive, model.StatusPastDue})).
+			Where("valid_until IS NOT NULL").
+			Where("valid_until < now() - make_interval(days => COALESCE((SELECT p.grace_days FROM plans p WHERE p.id = ?TableAlias.plan_id), 7))")
+	})
+}
+
 // IsTrialFallbackPlanConflict reports whether err is a plans CHECK
 // refusing trial_fallback_plan_id: on a plan that is not a trial plan,
 // or naming the plan itself. The admin API refuses both first; this is
@@ -762,6 +793,9 @@ func (s *Store) MoveEndedTrialToFallback(ctx context.Context, id string, before 
 				model.StatusExpired, lic.ID).Exec(ctx); err != nil {
 				return err
 			}
+			if err := endFloatingSessionsIfStoppedIn(ctx, tx, lic.ID, model.StatusExpired); err != nil {
+				return err
+			}
 			return syncSubscriptionStatus(ctx, tx, lic.ID, model.StatusExpired)
 		}
 		if from.TrialFallbackPlanID == "" || lic.StripeSubscriptionID != "" {
@@ -821,6 +855,9 @@ func (s *Store) expireLicenseWhere(ctx context.Context, id string, cond func(*bu
 			return nil
 		}
 		ok = true
+		if err := endFloatingSessionsIfStoppedIn(ctx, tx, id, model.StatusExpired); err != nil {
+			return err
+		}
 		return syncSubscriptionStatus(ctx, tx, id, model.StatusExpired)
 	})
 	return ok, err
@@ -989,9 +1026,10 @@ func (s *Store) ListUsers(ctx context.Context, search string, offset, limit int)
 
 // ─── Activation (admin) ───
 
+// DeleteActivationByID removes one activation; sql.ErrNoRows when it
+// is already gone (see DeleteActivation).
 func (s *Store) DeleteActivationByID(ctx context.Context, id string) error {
-	_, err := s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx)
-	return err
+	return deletedOne(s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx))
 }
 
 // FindActivationByID loads one activation.
@@ -1126,6 +1164,14 @@ func (s *Store) DeletePlanUnlessFallback(ctx context.Context, id string) error {
 			return ErrPlanHasLicenses
 		}
 		if err := GuardTrialFallbackTargetIn(ctx, tx, id); err != nil {
+			return err
+		}
+		// No licence is on it, but a subscription row may still name it:
+		// a downgrade before this version moved the licence and left its
+		// row behind (see syncSubscriptionPlanIn), and that row's foreign
+		// key would refuse the delete. It follows its licence first.
+		if _, err := tx.NewRaw(`UPDATE subscriptions s SET plan_id = l.plan_id, updated_at = now()
+			FROM licenses l WHERE l.id = s.license_id AND s.plan_id = ? AND l.plan_id <> ?`, id, id).Exec(ctx); err != nil {
 			return err
 		}
 		return deletedOne(tx.NewDelete().Model((*model.Plan)(nil)).Where("id = ?", id).Exec(ctx))

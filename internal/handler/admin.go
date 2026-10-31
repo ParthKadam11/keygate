@@ -135,19 +135,75 @@ func (h *AdminHandler) lockFeedGateIn(ctx context.Context, tx bun.Tx, productID 
 	return h.feedGateCheck(ctx, tx, prod)
 }
 
+// planTypeError: what a plan configures is not available on its
+// product's type as it is when the plan is written.
+type planTypeError struct{ msg string }
+
+func (e *planTypeError) Error() string { return e.msg }
+
+// planShapeColumns are the plan fields whose validity depends on the
+// product's type.
+var planShapeColumns = []string{"max_activations", "max_seats", "license_model", "per_seat"}
+
+// planFitsProductIn checks the plan against its product's type under
+// the product's shape lock (see store.ProductShapeLockIn), the request
+// having checked it against the type it read: a type change committed
+// in between would otherwise leave, say, a desktop product with a plan
+// selling seats. A plan sold per seat takes the max_seats the type
+// gives it (see normalizePerSeat), and wrote reports whether that moved
+// it. Called as the transaction's first statement.
+func planFitsProductIn(ctx context.Context, tx bun.Tx, p *model.Plan) (wrote bool, err error) {
+	if err := store.ProductShapeLockIn(ctx, tx, p.ProductID, false); err != nil {
+		return false, err
+	}
+	t, err := store.ProductTypeIn(ctx, tx, p.ProductID)
+	if err != nil {
+		return false, err
+	}
+	if p.PerSeat {
+		seats := 0
+		if model.ProductSupports(t, model.CapSeats) {
+			seats = 1
+		}
+		wrote = seats != p.MaxSeats
+		p.MaxSeats = seats
+	}
+	switch {
+	case !model.ProductSupports(t, model.CapActivations) && (p.MaxActivations > 0 || p.LicenseModel == "floating"):
+		return false, &planTypeError{"the product is now a " + t + " product, which has no device activations; reload and set the plan again"}
+	case !model.ProductSupports(t, model.CapSeats) && p.MaxSeats > 0:
+		return false, &planTypeError{"the product is now a " + t + " product, which has no seats; reload and set the plan again"}
+	}
+	return wrote, nil
+}
+
+// planTypeRefused answers a planTypeError.
+func planTypeRefused(c *gin.Context, err error) bool {
+	var typeErr *planTypeError
+	if !errors.As(err, &typeErr) {
+		return false
+	}
+	response.Err(c, http.StatusBadRequest, "INCOMPATIBLE_PRODUCT_TYPE", typeErr.msg)
+	return true
+}
+
 // createPlan and updatePlan write the plan, under the product's feed
 // gating lock when the plan sells an update period or renewals: the
 // gating state read before the write must still hold when it lands.
+//
+// Both check the plan against the product's type again under its shape
+// lock (planFitsProductIn): createPlan always, updatePlan when the
+// request touches a field that depends on it.
 //
 // A trial fallback the plan names is checked again under its lock (see
 // store.LockTrialFallbackIn), so an edit of that plan cannot slip in
 // between the check and the write.
 func (h *AdminHandler) createPlan(c *gin.Context, p *model.Plan, needsGatedFeed bool) error {
-	if !needsGatedFeed && p.TrialFallbackPlanID == "" {
-		return h.Store.CreatePlan(c, p)
-	}
 	h.Store.FillPlanIDs(p)
 	return h.Store.RunInTx(c, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := planFitsProductIn(ctx, tx, p); err != nil {
+			return err
+		}
 		// Plans first, then the product, as everywhere.
 		if p.TrialFallbackPlanID != "" {
 			if err := store.LockTrialFallbackIn(ctx, tx, p.TrialFallbackPlanID, p.ProductID); err != nil {
@@ -245,10 +301,28 @@ func (h *AdminHandler) updatePlan(c *gin.Context, p *model.Plan, needsGatedFeed,
 	if len(cols) == 0 {
 		return nil
 	}
-	if !needsGatedFeed && !typeChanged && !terms.carried() && fallback == (planFallbackWrite{}) {
+	shape := slices.ContainsFunc(cols, func(col string) bool { return slices.Contains(planShapeColumns, col) })
+	if !needsGatedFeed && !typeChanged && !shape && !terms.carried() && fallback == (planFallbackWrite{}) {
 		return h.Store.UpdatePlan(c, p, cols...)
 	}
 	return h.Store.RunInTx(c, func(ctx context.Context, tx bun.Tx) error {
+		// The shape lock first, whatever this write touches: a change of
+		// the product's type rewrites its per-seat plans' max_seats under
+		// the product's row lock, and a write that took this plan's row
+		// lock and then reached for the product's would cross it and
+		// deadlock. Shared, it waits for the type change instead.
+		if err := store.ProductShapeLockIn(ctx, tx, p.ProductID, false); err != nil {
+			return err
+		}
+		if shape {
+			wrote, err := planFitsProductIn(ctx, tx, p)
+			if err != nil {
+				return err
+			}
+			if wrote && !slices.Contains(cols, "max_seats") {
+				cols = append(cols, "max_seats")
+			}
+		}
 		// The row lock is what a license insert's foreign key waits
 		// on, so a fulfilment either got its license in before this
 		// (and the count below refuses the change) or blocks until
@@ -797,7 +871,17 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 	// the drain: that half of the request commits, so it travels
 	// beside the transaction rather than as its error.
 	var waiting *feedGateProblem
+	typeChange := slices.Contains(cols, "type")
 	err = h.Store.RunInTx(c, func(ctx context.Context, tx bun.Tx) error {
+		// A change of type waits for the writes that depend on the type
+		// (plans, releases) and they for it, so what is counted below is
+		// what the product holds when it changes (see
+		// store.ProductShapeLockIn). First, before any row lock.
+		if typeChange {
+			if err := store.ProductShapeLockIn(ctx, tx, p.ID, true); err != nil {
+				return err
+			}
+		}
 		// Row first, then the gate: the order the triggers use.
 		fresh, err := store.LockProductIn(ctx, tx, p.ID)
 		if err != nil {
@@ -805,6 +889,15 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 		}
 		if err := store.FeedGatingLockIn(ctx, tx, p.ID); err != nil {
 			return err
+		}
+		if typeChange && fresh.Type != p.Type {
+			problem, err := productTypeChangeProblemIn(ctx, tx, p.ID, p.Type)
+			if err != nil {
+				return err
+			}
+			if problem != nil {
+				return problem
+			}
 		}
 		rest := cols
 		if gatingNow {
@@ -851,6 +944,16 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 		return store.UpdateProductIn(ctx, tx, p, rest...)
 	})
 	if err != nil {
+		var typeProblem *apperr.AppError
+		if errors.As(err, &typeProblem) {
+			writeAppErr(c, typeProblem)
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			// Deleted after this handler read it.
+			response.NotFound(c, "product not found")
+			return
+		}
 		if feedGateRefused(c, err) {
 			return
 		}
@@ -873,6 +976,32 @@ func (h *AdminHandler) UpdateProduct(c *gin.Context) {
 		ActorType: "admin", ActorID: adminID(c),
 	})
 	response.OK(c, p)
+}
+
+// productTypeChangeProblemIn is the check UpdateProduct makes before its
+// transaction, made again under the product's shape lock: plans that
+// use what the new type lacks, or releases it would leave unreachable,
+// refuse the change. Nil when it may go ahead.
+func productTypeChangeProblemIn(ctx context.Context, tx bun.Tx, productID, newType string) (*apperr.AppError, error) {
+	n, err := store.CountPlansIncompatibleWithTypeIn(ctx, tx, productID, newType)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		return apperr.New(409, "INCOMPATIBLE_PLANS",
+			fmt.Sprintf("%d existing plan(s) use fields that are not valid for %s products; reset max_activations / max_seats / license_model on those plans first", n, newType)), nil
+	}
+	if !model.ProductSupports(newType, model.CapReleases) {
+		live, err := store.CountLiveReleasesIn(ctx, tx, productID)
+		if err != nil {
+			return nil, err
+		}
+		if live > 0 {
+			return apperr.New(400, "INCOMPATIBLE_PRODUCT_TYPE",
+				fmt.Sprintf("cannot change type to %s: %d release(s) would become unreachable — delete draft releases and yank published ones first", newType, live)), nil
+		}
+	}
+	return nil, nil
 }
 
 func (h *AdminHandler) DeleteProduct(c *gin.Context) {
@@ -904,6 +1033,12 @@ func (h *AdminHandler) DeleteProduct(c *gin.Context) {
 	if err := h.Store.DeleteProduct(c, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			response.NotFound(c, "product not found")
+			return
+		}
+		if store.IsStillReferenced(err) {
+			// A plan, licence or release was added after the count above.
+			response.Err(c, http.StatusConflict, "PRODUCT_IN_USE",
+				"something was added to this product while it was being deleted; reload to see what, and delete it first")
 			return
 		}
 		response.Internal(c, err)
@@ -1237,7 +1372,7 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		h.beforeCutoffWrite()
 	}
 	if err := h.createPlan(c, p, needsGatedFeed); err != nil {
-		if trialFallbackRefused(c, err) {
+		if trialFallbackRefused(c, err) || planTypeRefused(c, err) {
 			return
 		}
 		if feedGateRefused(c, err) {
@@ -1265,6 +1400,11 @@ func (h *AdminHandler) CreatePlan(c *gin.Context) {
 		}
 		if store.IsUniqueViolation(err) {
 			response.Err(c, http.StatusConflict, "DUPLICATE", "plan slug already exists for this product")
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) || store.IsForeignKeyViolation(err) {
+			// The product was deleted after it was checked.
+			response.NotFound(c, "product not found")
 			return
 		}
 		response.Internal(c, err)
@@ -1679,7 +1819,7 @@ func (h *AdminHandler) UpdatePlan(c *gin.Context) {
 		h.beforeCutoffWrite()
 	}
 	if err := h.updatePlan(c, p, needsGatedFeed, typeChanged, terms, cols, fallbackWrite); err != nil {
-		if trialFallbackRefused(c, err) {
+		if trialFallbackRefused(c, err) || planTypeRefused(c, err) {
 			return
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1997,14 +2137,17 @@ func (h *AdminHandler) UpdateEntitlement(c *gin.Context) {
 		e.QuotaUnit = *req.QuotaUnit
 	}
 	if req.StripeMeterEventName != nil {
-		// Same gate as CreatePlan: meter wiring requires quota
-		// semantics. Comparing against the post-merge ValueType in
-		// case the same request also flipped value_type.
-		if *req.StripeMeterEventName != "" && e.ValueType != "quota" {
-			response.BadRequest(c, "stripe_meter_event_name requires value_type=quota")
-			return
-		}
 		e.StripeMeterEventName = *req.StripeMeterEventName
+	}
+	// Same gate as CreateEntitlement: meter wiring requires quota
+	// semantics, checked on the merged row, so a quota turned into
+	// another type is refused while it keeps its meter. Not cleared
+	// for the caller: usage recorded and not yet sent to Stripe is sent
+	// under the meter, and dropped once it is gone, which the caller
+	// does knowingly by clearing it in the same request.
+	if e.StripeMeterEventName != "" && e.ValueType != "quota" {
+		response.BadRequest(c, "stripe_meter_event_name requires value_type=quota; clearing it (\"stripe_meter_event_name\": \"\") drops usage not yet sent to Stripe")
+		return
 	}
 	// Against the merged row, not the fields this request happened to
 	// carry: changing only the value of a quota, or only the type of
@@ -2123,6 +2266,11 @@ func (h *AdminHandler) CreateAPIKey(c *gin.Context) {
 		Scopes:    req.Scopes,
 	}
 	if err := h.Store.CreateAPIKey(c, ak, rawKey); err != nil {
+		if store.IsForeignKeyViolation(err) {
+			// The product it is bound to was deleted after it was checked.
+			response.NotFound(c, "product not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -2337,6 +2485,10 @@ func (h *AdminHandler) RotateAPIKey(c *gin.Context) {
 	rawKey := store.GenerateRawAPIKey()
 	prefix := rawKey[:12]
 	if err := h.Store.RotateAPIKey(c, ak.ID, rawKey, prefix); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "api key not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -2618,6 +2770,12 @@ func (h *AdminHandler) CreateLicense(c *gin.Context) {
 		if errors.Is(err, store.ErrPlanChanged) {
 			response.Conflict(c, "PLAN_CHANGED",
 				"the plan's license type changed while this license was being created; reload and try again", nil)
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			// The plan or the product was deleted meanwhile (see
+			// store.LockReferencedRowsIn).
+			response.NotFound(c, "plan not found")
 			return
 		}
 		response.Internal(c, err)
@@ -3008,14 +3166,32 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 		ActorType: "admin", ActorID: adminID(c),
 		Changes: map[string]any{"status": status},
 	})
-	if h.Webhook != nil {
-		if lic, err := h.Store.FindLicenseByID(c, id); err == nil {
+	// usable only when it was looked at: not claimed for a licence that
+	// could not be read back.
+	out := gin.H{"status": status}
+	if lic, err := h.Store.FindLicenseByID(c, id); err == nil {
+		out["usable"] = true
+		if h.Webhook != nil {
 			h.Webhook.Dispatch(c, lic.ProductID, "license.reinstated", map[string]any{
 				"license_id": id, "email": lic.Email, "status": status,
 			})
 		}
+		// Reinstating lifts the suspension and nothing else: a licence
+		// whose expiry and grace ran out while it was suspended goes on
+		// as one that lapsed, and the next expiry check expires it (or
+		// returns an upgraded one to its free plan). Its status reads
+		// "active" until then, so the answer says plainly that it does
+		// not work, and what brings it back.
+		if !service.IsLicenseUsable(lic) {
+			out["usable"] = false
+			if lic.StripeSubscriptionID != "" {
+				out["notice"] = "its expiry date passed while it was suspended, so it is not usable: its Stripe subscription sets a new expiry when it is paid"
+			} else {
+				out["notice"] = "its expiry date passed while it was suspended, so it is not usable: set a new expiry date to keep it"
+			}
+		}
 	}
-	response.OK(c, gin.H{"status": status})
+	response.OK(c, out)
 }
 
 // SetLicenseValidUntil sets or clears a license's expiry date. An
@@ -3436,6 +3612,11 @@ func (h *AdminHandler) DeleteActivation(c *gin.Context) {
 		return
 	}
 	if err := h.Store.DeleteActivationByID(c, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Removed meanwhile by another call, which reports it.
+			response.NotFound(c, "activation not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -4046,6 +4227,16 @@ func (h *AdminHandler) AddLicenseAddon(c *gin.Context) {
 	la := &model.LicenseAddon{LicenseID: id, AddonID: req.AddonID, Enabled: true}
 	created, err := h.Store.AddLicenseAddon(c, la)
 	if err != nil {
+		if errors.Is(err, store.ErrAddonInactive) {
+			response.Err(c, http.StatusConflict, "ADDON_INACTIVE",
+				"this addon is no longer offered; licenses that have it keep it")
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) || store.IsForeignKeyViolation(err) {
+			// The addon or the licence was deleted meanwhile.
+			response.NotFound(c, "addon not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
@@ -4205,6 +4396,13 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 		}
 		if newPlan.ProductID != locked.ProductID {
 			moved = true
+			return nil
+		}
+		// Asked to "move" to the plan it is on: nothing changes, not even
+		// the shape the plan's type would give a licence issued now. The
+		// plan may have been retyped since this licence was issued, and
+		// a write here would quietly clear its update period.
+		if newPlan.ID == locked.PlanID {
 			return nil
 		}
 
@@ -4407,12 +4605,23 @@ func (h *AdminHandler) ChangeLicensePlan(c *gin.Context) {
 		if feedGateConflict(c, err) {
 			return
 		}
+		if errors.Is(err, sql.ErrNoRows) {
+			// The plan, or the licence, was deleted meanwhile.
+			response.NotFound(c, "plan not found")
+			return
+		}
 		response.Internal(c, err)
 		return
 	}
 	if moved {
 		response.Conflict(c, "LICENSE_CHANGED",
 			"the license moved to another plan while you were editing it; reload and try again", nil)
+		return
+	}
+	// Moved to the plan it is on, nothing was written (see above), so
+	// there is nothing to record or tell the customer.
+	if req.PlanID == oldPlanID {
+		response.OK(c, gin.H{"status": "plan_changed", "plan_id": req.PlanID})
 		return
 	}
 
@@ -4824,8 +5033,14 @@ func (h *AdminHandler) RunMeteredSync(c *gin.Context) {
 			"metered billing syncer is not wired on this server")
 		return
 	}
-	pushed := h.Metered.RunOnce(c.Request.Context(), 200)
-	response.OK(c, gin.H{"pushed": pushed})
+	// skipped: another pass, on this replica or another, is draining the
+	// queue now; it pushes what this one would have.
+	pushed, ran, err := h.Metered.TryRunOnce(c.Request.Context(), 200)
+	if err != nil {
+		response.Internal(c, err)
+		return
+	}
+	response.OK(c, gin.H{"pushed": pushed, "skipped": !ran})
 }
 
 // RunExpiryChecks triggers one full pass of the lifecycle checker on
@@ -5126,6 +5341,9 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 	})
 
 	dateStr := time.Now().Format("2006-01-02")
+	// Every plaintext key: not to be kept by a browser or proxy cache,
+	// as the single reveal is not.
+	c.Header("Cache-Control", "no-store")
 
 	if format == "json" {
 		filename := fmt.Sprintf("licenses-%s.json", dateStr)
@@ -5147,6 +5365,9 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 			// the license actually has must travel with it.
 			UpdatesUntil string `json:"updates_until"`
 			CreatedAt    string `json:"created_at"`
+			// Quantity is the seats bought on a plan sold per seat (1
+			// otherwise): what the licence holds travels with it.
+			Quantity int `json:"quantity"`
 		}
 
 		out := make([]exportLicense, 0, len(licenses))
@@ -5178,6 +5399,7 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 				ValidUntil:   validUntil,
 				UpdatesUntil: updatesUntil,
 				CreatedAt:    l.CreatedAt.Format(time.RFC3339),
+				Quantity:     l.Quantity,
 			})
 		}
 
@@ -5197,7 +5419,9 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 	w := csv.NewWriter(c.Writer)
 	defer w.Flush()
 
-	_ = w.Write([]string{"id", "email", "product", "plan", "status", "license_key", "valid_from", "valid_until", "updates_until", "created_at"})
+	// quantity last, so a reader of the earlier columns by position is
+	// unaffected.
+	_ = w.Write([]string{"id", "email", "product", "plan", "status", "license_key", "valid_from", "valid_until", "updates_until", "created_at", "quantity"})
 
 	for _, l := range licenses {
 		productName := ""
@@ -5227,6 +5451,7 @@ func (h *AdminHandler) ExportLicenses(c *gin.Context) {
 			validUntil,
 			updatesUntil,
 			l.CreatedAt.Format(time.RFC3339),
+			strconv.Itoa(l.Quantity),
 		}))
 	}
 }

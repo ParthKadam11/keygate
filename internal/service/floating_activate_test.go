@@ -108,6 +108,22 @@ func TestFloatingPlanRefusesDeviceActivation(t *testing.T) {
 	if _, err := fs.CheckOut(ctx, CheckOutInput{LicenseKey: key2, Identifier: "laptop"}); err != nil {
 		t.Errorf("the one seat is free for checkout: %v", err)
 	}
+	if _, err := fs.Heartbeat(ctx, key2, "laptop", ""); err != nil {
+		t.Errorf("heartbeat on the floating plan: %v", err)
+	}
+
+	// And back to standard: the session taken out on the floating plan
+	// renews no longer, so it cannot run on beside the device the
+	// standard plan's one activation now goes to.
+	if _, err := s.DB.NewUpdate().Model((*model.Plan)(nil)).Set("license_model = 'standard'").Where("id = ?", std.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.Heartbeat(ctx, key2, "laptop", ""); !errors.As(err, &ae) || ae.Code != "LICENSE_NOT_FOUND" {
+		t.Errorf("heartbeat after the plan became standard = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if _, err := ls.Activate(ctx, ActivateInput{LicenseKey: key2, Identifier: "desk"}); err != nil {
+		t.Errorf("activate on the plan made standard again: %v", err)
+	}
 }
 
 // An addon of another product attached to a licence (refused now, but it

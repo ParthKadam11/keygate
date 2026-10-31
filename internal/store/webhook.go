@@ -41,10 +41,15 @@ func (s *Store) ListWebhooks(ctx context.Context, productID, search string, p Pa
 	return out, total, nil
 }
 
-func (s *Store) UpdateWebhook(ctx context.Context, w *model.Webhook) error {
+// UpdateWebhook writes only the named columns of w, and reads the row
+// back into w as it now stands. Writing the whole row put back what the
+// caller had read for the rest, so two edits on two replicas (a new URL
+// on one, active=false on the other) kept only one: a receiver switched
+// off came back on. sql.ErrNoRows when the webhook is gone.
+func (s *Store) UpdateWebhook(ctx context.Context, w *model.Webhook, columns ...string) error {
 	w.UpdatedAt = time.Now()
-	_, err := s.DB.NewUpdate().Model(w).WherePK().Exec(ctx)
-	return err
+	return s.DB.NewUpdate().Model(w).Column(append(columns, "updated_at")...).WherePK().
+		Returning("*").Scan(ctx)
 }
 
 func (s *Store) DeleteWebhook(ctx context.Context, id string) error {

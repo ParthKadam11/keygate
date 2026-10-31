@@ -1280,6 +1280,14 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 	if err != nil {
 		return err
 	}
+	// Paused, expired or revoked by Stripe: its floating sessions end as
+	// an operator's suspension ends them, so a resume brings back the
+	// licence and not the leases it held.
+	if n, err := res.RowsAffected(); err == nil && n > 0 && slices.Contains(cols, "status") {
+		if err := endFloatingSessionsIfStoppedIn(ctx, tx, lic.ID, lic.Status); err != nil {
+			return err
+		}
+	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 && (guarded || asOf != nil || stillLinked) {
 		var now struct {
 			Linked bool       `bun:"linked"`
@@ -1610,9 +1618,11 @@ func (s *Store) TouchActivation(ctx context.Context, id string) error {
 	return err
 }
 
+// DeleteActivation removes one activation: sql.ErrNoRows when it is
+// already gone, so of two releasing the same device only one goes on
+// to audit it and fire license.deactivated.
 func (s *Store) DeleteActivation(ctx context.Context, id string) error {
-	_, err := s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx)
-	return err
+	return deletedOne(s.DB.NewDelete().Model((*model.Activation)(nil)).Where("id = ?", id).Exec(ctx))
 }
 
 func (s *Store) CountActivations(ctx context.Context, licenseID string) (int, error) {
@@ -2672,12 +2682,24 @@ func (s *Store) LowerLicenseTerms(ctx context.Context, licenseID string, to Lice
 		if err := check(u); err != nil {
 			return err
 		}
-		_, err = tx.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
+		if _, err := tx.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
 			terms_held_until = clock_timestamp() + make_interval(secs => ?), terms_check_after = NULL, updated_at = now()
-			WHERE id = ?`, to.PlanID, to.Quantity, hold.Seconds(), licenseID).Exec(ctx)
-		return err
+			WHERE id = ?`, to.PlanID, to.Quantity, hold.Seconds(), licenseID).Exec(ctx); err != nil {
+			return err
+		}
+		return syncSubscriptionPlanIn(ctx, tx, licenseID, to.PlanID)
 	})
 	return prev, err
+}
+
+// syncSubscriptionPlanIn moves the licence's subscription row to the plan
+// the licence is now on. The row names the plan by a foreign key: one
+// left on a plan the licence has left keeps that plan from being
+// deleted, with nothing on it the admin could see or move.
+func syncSubscriptionPlanIn(ctx context.Context, db bun.IDB, licenseID, planID string) error {
+	_, err := db.NewRaw(`UPDATE subscriptions SET plan_id = ?, updated_at = now()
+		WHERE license_id = ? AND plan_id <> ?`, planID, licenseID, planID).Exec(ctx)
+	return err
 }
 
 // MarkLicenseRead moves the licence's read stamp to now: every read of
@@ -2693,10 +2715,18 @@ func (s *Store) MarkLicenseRead(ctx context.Context, licenseID string) error {
 // for a change Stripe did not make, unless something has moved them
 // since.
 func (s *Store) RestoreLicenseTerms(ctx context.Context, licenseID string, lowered, prev LicenseTerms) error {
-	_, err := s.DB.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
-		terms_held_until = NULL, terms_check_after = NULL, updated_at = now()
-		WHERE id = ? AND plan_id = ? AND quantity = ?`, prev.PlanID, prev.Quantity, licenseID, lowered.PlanID, lowered.Quantity).Exec(ctx)
-	return err
+	return RunInTx(ctx, s.DB, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewRaw(`UPDATE licenses SET plan_id = ?, quantity = ?, stripe_synced_at = clock_timestamp(),
+			terms_held_until = NULL, terms_check_after = NULL, updated_at = now()
+			WHERE id = ? AND plan_id = ? AND quantity = ?`, prev.PlanID, prev.Quantity, licenseID, lowered.PlanID, lowered.Quantity).Exec(ctx)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil // moved since; its subscription row moved with it
+		}
+		return syncSubscriptionPlanIn(ctx, tx, licenseID, prev.PlanID)
+	})
 }
 
 // stricterSeatLimit is the lower of two seat limits, where 0 means no

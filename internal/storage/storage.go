@@ -45,6 +45,12 @@ type Storage interface {
 	// Delete removes an object. Returns nil if the object did not exist
 	// (idempotent — matches S3 DeleteObject semantics).
 	Delete(ctx context.Context, key string) error
+
+	// Copy copies the object at src to dst inside the store, without the
+	// bytes passing through this server; size is src's, for stores that
+	// copy large objects in parts. Returns ErrObjectNotFound if src does
+	// not exist.
+	Copy(ctx context.Context, src, dst string, size int64) error
 }
 
 // ObjectInfo is the subset of object metadata the release service consumes.
@@ -87,3 +93,7 @@ func (Disabled) Delete(_ context.Context, _ string) error {
 
 // Compile-time check.
 var _ Storage = Disabled{}
+
+func (Disabled) Copy(_ context.Context, _, _ string, _ int64) error {
+	return ErrStorageDisabled
+}

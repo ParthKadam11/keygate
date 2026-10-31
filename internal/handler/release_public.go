@@ -519,5 +519,12 @@ func (h *ReleasePublicHandler) writeFeedCacheHeaders(c *gin.Context, req feedReq
 	if req.licensed {
 		return
 	}
-	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(int(FeedPublicMaxAge.Seconds())))
+	// No longer than the download links in it stay valid: with a feed
+	// URL TTL under FeedPublicMaxAge, a cache would go on serving links
+	// that already answer 403.
+	maxAge := FeedPublicMaxAge
+	if h.feedTTL > 0 {
+		maxAge = min(maxAge, h.feedTTL)
+	}
+	c.Header("Cache-Control", "public, max-age="+strconv.Itoa(int(maxAge.Seconds())))
 }

@@ -18,6 +18,9 @@ var (
 	// active key for the same product. Callers should call RotateSigningKey
 	// instead of two separate Create calls.
 	ErrSigningKeyAlreadyActive = errors.New("product already has an active signing key; rotate instead of create")
+	// ErrSigningKeyInactive is returned by DeactivateSigningKey for a key
+	// already deactivated, by a rotation or another call.
+	ErrSigningKeyInactive = errors.New("signing key is already inactive")
 )
 
 // signingKeyRotateLockSeed is hashed with the product_id to derive a
@@ -29,15 +32,29 @@ const signingKeyRotateLockSeed int64 = 0x6b657967727274 // "keygrt" in hex
 // ensuring at most one active key per product exists at the time of call;
 // the partial unique index will reject violations with a unique-constraint
 // error which we surface as ErrSigningKeyAlreadyActive.
+//
+// It takes RotateSigningKey's lock: a rotation overlapping it then sees
+// the key made here and retires it, rather than meeting it in the
+// unique index.
 func (s *Store) CreateSigningKey(ctx context.Context, k *model.ReleaseSigningKey) error {
 	if k.ID == "" {
 		k.ID = newID()
 	}
-	_, err := s.DB.NewInsert().Model(k).Exec(ctx)
-	if isUniqueViolation(err) {
-		return ErrSigningKeyAlreadyActive
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	return err
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(?)", signingKeyRotateLockSeed^stringHash(k.ProductID)); err != nil {
+		return fmt.Errorf("acquire rotate lock: %w", err)
+	}
+	if _, err := tx.NewInsert().Model(k).Exec(ctx); err != nil {
+		if isUniqueViolation(err) {
+			return ErrSigningKeyAlreadyActive
+		}
+		return err
+	}
+	return tx.Commit()
 }
 
 // FindActiveSigningKey returns the (single) active key for a product.
@@ -167,7 +184,7 @@ func (s *Store) DeactivateSigningKey(ctx context.Context, id, note string) error
 		if _, err := s.FindSigningKeyByID(ctx, id); err != nil {
 			return err
 		}
-		return errors.New("signing key is already inactive")
+		return ErrSigningKeyInactive
 	}
 	return nil
 }

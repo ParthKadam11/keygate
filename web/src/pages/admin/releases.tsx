@@ -120,7 +120,9 @@ export default function ReleasesPage() {
   const releases = data?.releases || []
   const total = data?.total || 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const latestByBucket = computeLatestVersions(releases)
+  // From the server's list of what is published, not this page: a draft
+  // is warned against the newest release whatever filter or page shows it.
+  const latestByBucket = computeLatestVersions(data?.latest_published || [])
 
   const publishMut = useMutation({
     mutationFn: admin.publishRelease,
@@ -956,26 +958,32 @@ const CHANNEL_FALLBACK: Record<string, string[]> = {
   dev: ["dev", "alpha", "beta", "stable"],
 }
 
-function computeLatestVersions(releases: Release[]): Map<string, string> {
+function computeLatestVersions(
+  published: { product_id: string; channel: string; version: string }[],
+): Map<string, string> {
   const perChannelMax = new Map<string, string>()
-  for (const r of releases) {
-    if (r.status !== "published") continue
+  const products = new Set<string>()
+  for (const r of published) {
+    products.add(r.product_id)
     const key = `${r.product_id}|${r.channel}`
     const cur = perChannelMax.get(key)
     if (!cur || compareSemver(r.version, cur) > 0) {
       perChannelMax.set(key, r.version)
     }
   }
+  // Every channel a draft can be on, including one with nothing published
+  // yet: a beta draft below the stable release is behind what beta users
+  // already get, through the fallback chain.
   const out = new Map<string, string>()
-  for (const [key] of perChannelMax) {
-    const [productID, channel] = key.split("|")
-    const chain = CHANNEL_FALLBACK[channel] ?? [channel]
-    let max = ""
-    for (const ch of chain) {
-      const v = perChannelMax.get(`${productID}|${ch}`)
-      if (v && (!max || compareSemver(v, max) > 0)) max = v
+  for (const productID of products) {
+    for (const [channel, chain] of Object.entries(CHANNEL_FALLBACK)) {
+      let max = ""
+      for (const ch of chain) {
+        const v = perChannelMax.get(`${productID}|${ch}`)
+        if (v && (!max || compareSemver(v, max) > 0)) max = v
+      }
+      if (max) out.set(`${productID}|${channel}`, max)
     }
-    if (max) out.set(key, max)
   }
   return out
 }

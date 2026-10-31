@@ -127,6 +127,10 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 			return nil, apperr.Conflict("UPGRADE_IN_PROGRESS",
 				"an upgrade of this license is waiting for payment; finish or close it before inviting people")
 		}
+		if errors.Is(err, store.ErrUpgradeSeatLimit) {
+			return nil, apperr.Conflict("UPGRADE_SEAT_LIMIT",
+				"the plan this license is being upgraded to has no seat left for another person")
+		}
 		if errors.Is(err, store.ErrSeatLimitReached) {
 			// People on the license, the owner included, as max_seats
 			// counts them.
@@ -181,6 +185,9 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 		},
 	})
 
+	// The account behind the seat is the admin's to see, as in ListSeats:
+	// a seat already accepted comes back as stored.
+	seat.UserID = ""
 	return seat, nil
 }
 
@@ -358,6 +365,12 @@ func (s *SeatService) ListSeats(ctx context.Context, licenseKey, productID, acto
 	}
 	if err := s.store.MarkPausedSeats(ctx, lic.ID, seats); err != nil {
 		return nil, apperr.Internal(err)
+	}
+	// The accounts behind the seats are the admin's to see, as the
+	// portal's copy of the licence leaves them out (trimForOwner,
+	// trimForMember).
+	for _, seat := range seats {
+		seat.UserID = ""
 	}
 	return seats, nil
 }

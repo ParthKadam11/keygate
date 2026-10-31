@@ -50,6 +50,14 @@ func (f *fakeStorage) Delete(_ context.Context, key string) error {
 	delete(f.objects, key)
 	return nil
 }
+func (f *fakeStorage) Copy(_ context.Context, src, dst string, _ int64) error {
+	data, ok := f.objects[src]
+	if !ok {
+		return storage.ErrObjectNotFound
+	}
+	f.objects[dst] = bytes.Clone(data)
+	return nil
+}
 
 func mustAEAD(t *testing.T) *crypto.AESGCM {
 	t.Helper()

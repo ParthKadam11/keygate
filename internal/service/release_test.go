@@ -425,7 +425,9 @@ func TestNormalizePlatform(t *testing.T) {
 		"windows-x86_64": "windows-x64",
 		"linux-armv7":    "linux-armhf",
 		"darwin-arm64":   "darwin-arm64", // canonical passes through
-		"freebsd-x64":    "freebsd-x64",  // unknown: unchanged, validation rejects
+		"Linux-X64":      "linux-x64",    // canonical, whatever its case, as aliases are
+		"freebsd-x64":    "freebsd-x64",  // unknown: validation rejects
+		"FreeBSD-X64":    "freebsd-x64",
 	}
 	for in, want := range cases {
 		if got := NormalizePlatform(in); got != want {

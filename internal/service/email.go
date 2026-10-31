@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -270,7 +271,12 @@ func (s *EmailService) sendResolved(cfg resolvedConfig, to, subject, htmlBody st
 // the resolved config names. This is the single point every provider
 // goes through, so retry, logging and the attribution footer above are
 // shared and provider-agnostic.
+//
+// The subject is built from settings and names (site, product), so a
+// line break in one must not start a header of its own; and a header
+// carries only ASCII, so the rest is encoded (RFC 2047).
 func (s *EmailService) deliver(cfg resolvedConfig, to, subject, htmlBody string) error {
+	subject = subjectLine.Replace(subject)
 	switch cfg.provider {
 	case "cloudflare":
 		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
@@ -280,7 +286,7 @@ func (s *EmailService) deliver(cfg resolvedConfig, to, subject, htmlBody string)
 		msg := []byte(strings.Join([]string{
 			"From: " + cfg.from,
 			"To: " + to,
-			"Subject: " + subject,
+			"Subject: " + mime.QEncoding.Encode("utf-8", subject),
 			"MIME-Version: 1.0",
 			"Content-Type: text/html; charset=UTF-8",
 			"",
@@ -638,6 +644,9 @@ func parseEnvelopeAddress(from string) (string, error) {
 	return a.Address, nil
 }
 
+// subjectLine keeps a subject on one line.
+var subjectLine = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+
 // validateSMTPLine rejects strings containing CR or LF so callers
 // can't smuggle additional SMTP commands through a header value.
 func validateSMTPLine(s string) error {
@@ -755,7 +764,7 @@ func (s *EmailService) SendSeatInvite(to, productName, inviterName, acceptURL, d
 	// contain the claim URL (custom template missed the placeholder),
 	// append it so the recipient still has a way in.
 	if acceptURL != "" && !strings.Contains(body, acceptURL) {
-		body += `<p style="margin-top:24px;font-size:13px;color:#555;">Accept the invitation: <a href="` + acceptURL + `">` + acceptURL + `</a></p>`
+		body += `<p style="margin-top:24px;font-size:13px;color:#555;">Accept the invitation: <a href="` + html.EscapeString(acceptURL) + `">` + html.EscapeString(acceptURL) + `</a></p>`
 	}
 	go func() {
 		if err := s.Send(to, "You've been invited to "+productName, body); err != nil {
@@ -823,14 +832,14 @@ func (s *EmailService) SendSubscriptionCanceled(to, productName string, immediat
 		tmpl = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Subscription Canceled</h2>
-<p>Your <strong>` + productName + `</strong> subscription has been canceled immediately.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> subscription has been canceled immediately.</p>
 <p>Your access has ended. Thank you for being a customer.</p>
 </body></html>`
 	} else {
 		tmpl = `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Subscription Will Be Canceled</h2>
-<p>Your <strong>` + productName + `</strong> subscription will be canceled at the end of the current billing period.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> subscription will be canceled at the end of the current billing period.</p>
 <p>You can continue using the service until then.</p>
 </body></html>`
 	}
@@ -862,7 +871,7 @@ func (s *EmailService) SendDunningSecond(to, productName string) {
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #d97706;">Payment Still Outstanding</h2>
-<p>We've been unable to process your payment for <strong>` + productName + `</strong> for over a week.</p>
+<p>We've been unable to process your payment for <strong>` + html.EscapeString(productName) + `</strong> for over a week.</p>
 <p>Please update your payment method to avoid losing access.</p>
 </body></html>`
 	go func() {
@@ -879,7 +888,7 @@ func (s *EmailService) SendDunningFinal(to, productName string) {
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #dc2626;">Final Notice — Access Will Be Suspended</h2>
-<p>Your <strong>` + productName + `</strong> payment has been overdue for 14 days.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> payment has been overdue for 14 days.</p>
 <p>Your access will be suspended soon if payment is not received.</p>
 <p>Please update your payment method immediately.</p>
 </body></html>`
@@ -932,7 +941,7 @@ func (s *EmailService) SendPaymentRecovered(to, productName string) {
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #059669;">Payment Recovered — Thanks!</h2>
-<p>Your payment for <strong>` + productName + `</strong> went through. Your subscription is active again, and access is fully restored.</p>
+<p>Your payment for <strong>` + html.EscapeString(productName) + `</strong> went through. Your subscription is active again, and access is fully restored.</p>
 <p>No further action required.</p>
 </body></html>`
 	go func() {
@@ -950,7 +959,9 @@ func (s *EmailService) SendWelcome(to, name string) {
 	// project name so an empty setting still greets as Keygate.
 	data := s.templateData(map[string]any{"Name": name})
 	site, _ := data["SiteName"].(string)
-	if strings.TrimSpace(site) == "" {
+	site = strings.TrimSpace(site)
+	data["SiteName"] = site
+	if site == "" {
 		site = branding.Project
 		data["SiteName"] = site
 	}
@@ -985,7 +996,7 @@ func (s *EmailService) SendPlanChanged(to, productName, oldPlan, newPlan string)
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Plan Changed</h2>
-<p>Your <strong>` + productName + `</strong> plan has been changed from <strong>` + oldPlan + `</strong> to <strong>` + newPlan + `</strong>.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> plan has been changed from <strong>` + html.EscapeString(oldPlan) + `</strong> to <strong>` + html.EscapeString(newPlan) + `</strong>.</p>
 </body></html>`
 	go func() {
 		if err := s.Send(to, productName+" plan changed", body); err != nil {
@@ -1013,8 +1024,8 @@ func (s *EmailService) SendPaymentActionRequired(to, productName, invoiceURL str
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2 style="color: #d97706;">Payment Authentication Required</h2>
-<p>Your payment for <strong>` + productName + `</strong> requires additional authentication.</p>
-<p><a href="` + invoiceURL + `" style="display:inline-block;background:#2563eb;color:white;padding:10px 24px;border-radius:6px;text-decoration:none;">Complete Payment</a></p>
+<p>Your payment for <strong>` + html.EscapeString(productName) + `</strong> requires additional authentication.</p>
+<p><a href="` + html.EscapeString(invoiceURL) + `" style="display:inline-block;background:#2563eb;color:white;padding:10px 24px;border-radius:6px;text-decoration:none;">Complete Payment</a></p>
 <p style="color:#666;font-size:14px;">If you don't complete this step, your subscription may be interrupted.</p>
 </body></html>`
 	go func() {
@@ -1031,7 +1042,7 @@ func (s *EmailService) SendTrialEnding(to, productName, trialEnd string) {
 	body := `<!DOCTYPE html>
 <html><body style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
 <h2>Your Trial is Ending Soon</h2>
-<p>Your <strong>` + productName + `</strong> trial ends on <strong>` + trialEnd + `</strong>.</p>
+<p>Your <strong>` + html.EscapeString(productName) + `</strong> trial ends on <strong>` + html.EscapeString(trialEnd) + `</strong>.</p>
 <p>After the trial, your subscription will begin automatically. No action needed if you'd like to continue.</p>
 <p style="color:#666;font-size:14px;">If you'd like to cancel, you can do so from your account portal before the trial ends.</p>
 </body></html>`
