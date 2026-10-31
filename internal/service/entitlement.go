@@ -105,10 +105,7 @@ func (s *EntitlementService) Check(ctx context.Context, in CheckInput) (*CheckRe
 			if counter != nil {
 				used = counter.Used
 			}
-			remaining := limit - used
-			if limit == 0 {
-				remaining = -1
-			}
+			remaining := quotaRemaining(limit, used)
 			fs.Used = &used
 			fs.Limit = &limit
 			fs.Remaining = &remaining

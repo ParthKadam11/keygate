@@ -681,7 +681,8 @@ paths:
       summary: Get quota status
       description: |
         Returns current usage and remaining quota for a feature. A quota
-        with `limit: 0` is unlimited and reports `remaining: -1`.
+        with `limit: 0` is unlimited and reports `remaining: -1`. Usage past a
+        limit that was lowered afterwards reports `remaining: 0`.
 
         Note that a feature without a quota entitlement answers `404
         QUOTA_NOT_FOUND` here, while `/license/usage` answers `400
@@ -6659,7 +6660,7 @@ components:
                     description: Quota features only; 0 = unlimited
                   remaining:
                     type: integer
-                    description: Quota features only; -1 when unlimited
+                    description: Quota features only; -1 when unlimited, never otherwise negative
                   period:
                     type: string
                     enum: [hourly, daily, monthly, yearly]
@@ -6715,7 +6716,7 @@ components:
               description: 0 = unlimited
             remaining:
               type: integer
-              description: -1 when unlimited
+              description: -1 when unlimited, never otherwise negative
             period:
               type: string
             period_key:

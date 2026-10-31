@@ -158,3 +158,83 @@ func TestAddonsReachVerifyTokenAndUsage(t *testing.T) {
 		t.Errorf("after removing addons got %v, want the plan's features only", features)
 	}
 }
+
+// A limit lowered below what was already used leaves nothing remaining.
+// -1 means unlimited, so the overage must not be reported as a negative
+// balance: used one past the limit would read as an unlimited quota.
+func TestQuotaLoweredBelowUsageReportsNothingRemaining(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
+	}
+	s, err := store.New(dsn)
+	if err != nil {
+		t.Skipf("skipping integration test: %v", err)
+	}
+	defer s.Close()
+	if err := s.RunMigrations("../../db/migrations"); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	ctx := context.Background()
+	suffix := time.Now().Format("150405.000000")
+
+	prod := &model.Product{Name: "Lowered", Slug: "lowered-" + suffix, Type: "desktop"}
+	if err := s.CreateProduct(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+	plan := &model.Plan{ProductID: prod.ID, Name: "Base", Slug: "lowered-" + suffix, LicenseType: "perpetual", LicenseModel: "standard"}
+	if err := s.CreatePlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	ent := &model.Entitlement{PlanID: plan.ID, Feature: "api_calls", ValueType: "quota", Value: "10", QuotaPeriod: "monthly"}
+	if err := s.CreateEntitlement(ctx, ent); err != nil {
+		t.Fatal(err)
+	}
+	key := "KG-LOWERED-" + suffix
+	lic := &model.License{ProductID: prod.ID, PlanID: plan.ID, Email: "lowered-" + suffix + "@example.com", LicenseKey: key, Status: model.StatusActive}
+	if err := s.CreateLicense(ctx, lic); err != nil {
+		t.Fatal(err)
+	}
+
+	wh := NewWebhookService(s, slog.Default(), 10*time.Second, 5, false)
+	us := NewUsageService(s, wh, nil, slog.Default(), 0.8)
+	es := NewEntitlementService(s, slog.Default())
+	for i := 1; i <= 8; i++ {
+		if _, err := us.RecordUsage(ctx, RecordUsageInput{LicenseKey: key, Feature: "api_calls", Quantity: 1}); err != nil {
+			t.Fatalf("use %d of 10 refused: %v", i, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  int64
+	}{
+		{"within the limit", "10", 2},
+		{"at the limit", "8", 0},
+		{"one past the limit", "7", 0},
+		{"far past the limit", "5", 0},
+		{"unlimited", "0", -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ent.Value = tc.value
+			if err := s.UpdateEntitlement(ctx, ent); err != nil {
+				t.Fatal(err)
+			}
+			st, err := us.GetQuotaStatus(ctx, key, "api_calls", "")
+			if err != nil {
+				t.Fatalf("usage status: %v", err)
+			}
+			if st.Used != 8 || st.Remaining != tc.want {
+				t.Errorf("status used = %d, remaining = %d, want used 8, remaining %d", st.Used, st.Remaining, tc.want)
+			}
+			res, err := es.Check(ctx, CheckInput{LicenseKey: key, Feature: "api_calls"})
+			if err != nil {
+				t.Fatalf("entitlement check: %v", err)
+			}
+			if got := *res.Features["api_calls"].Remaining; got != tc.want {
+				t.Errorf("entitlement remaining = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
