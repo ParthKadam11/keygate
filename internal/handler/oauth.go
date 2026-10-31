@@ -266,6 +266,12 @@ func (h *AuthHandler) DevLogin(c *gin.Context) {
 	// Normalize for parity with the OTP/setup paths — otherwise
 	// "Foo@x.com" and "foo@x.com" become two distinct user rows.
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	// The address rides in the session token too: one of any length made
+	// a cookie past what a client reads.
+	if err := apperr.ValidateEmail(req.Email); err != nil {
+		response.BadRequest(c, err.Message)
+		return
+	}
 	if req.Name == "" {
 		req.Name = "Dev User"
 	}

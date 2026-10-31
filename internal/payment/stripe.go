@@ -154,7 +154,15 @@ func (h *StripeHandler) CreateCheckoutSession(c *gin.Context) {
 	if plan.LicenseType == "perpetual" {
 		mode = string(stripe.CheckoutSessionModePayment)
 	}
-	item, err := checkoutLineItem(plan, req.PriceID, mode == string(stripe.CheckoutSessionModeSubscription), req.Quantity)
+	// Whether the price is metered is Stripe's to say: it decides how the
+	// line item is written (see checkoutLineItem).
+	sp, err := stripeprice.Get(req.PriceID, nil)
+	if err != nil {
+		slog.Error("stripe: failed to fetch price", "price_id", req.PriceID, "error", err)
+		response.Err(c, http.StatusServiceUnavailable, "PAYMENT_CONFIG_ERROR", "payment configuration error")
+		return
+	}
+	item, err := checkoutLineItem(plan, req.PriceID, mode == string(stripe.CheckoutSessionModeSubscription), priceMetered(sp), req.Quantity)
 	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
@@ -241,7 +249,7 @@ func (h *StripeHandler) CheckoutByPlan(c *gin.Context) {
 	if sp.Type == "one_time" {
 		mode = string(stripe.CheckoutSessionModePayment)
 	}
-	item, err := checkoutLineItem(plan, plan.StripePriceID, mode == string(stripe.CheckoutSessionModeSubscription), requested)
+	item, err := checkoutLineItem(plan, plan.StripePriceID, mode == string(stripe.CheckoutSessionModeSubscription), priceMetered(sp), requested)
 	if err != nil {
 		c.String(http.StatusBadRequest, err.Error())
 		return
@@ -263,6 +271,7 @@ func (h *StripeHandler) CheckoutByPlan(c *gin.Context) {
 
 	s, err := session.New(params)
 	if err != nil {
+		slog.Error("stripe: failed to create checkout session", "plan_id", plan.ID, "price_id", plan.StripePriceID, "error", err)
 		c.String(http.StatusInternalServerError, "checkout unavailable")
 		return
 	}
@@ -688,7 +697,7 @@ func (h *StripeHandler) onAsyncPaymentFailed(ctx context.Context, raw json.RawMe
 				}
 			}
 			if !ours {
-				plan, _, err := h.resolvePlan(ctx, data.Subscription.ID)
+				plan, _, _, err := h.resolvePlan(ctx, data.Subscription.ID)
 				if err != nil {
 					return fmt.Errorf("unpaid checkout %s: %w", data.ID, err)
 				}
@@ -762,12 +771,13 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		return h.fulfillUpgrade(ctx, customerID, subscriptionID, paymentIntentID, metadata, sessionID, source)
 	}
 	var plan *model.Plan
+	var sub *stripe.Subscription
 	var err error
 	// The seats the subscription bills; a one-time purchase is one.
 	quantity := 1
 
 	if subscriptionID != "" {
-		if plan, quantity, err = h.resolvePlan(ctx, subscriptionID); err != nil {
+		if plan, quantity, sub, err = h.resolvePlan(ctx, subscriptionID); err != nil {
 			return false, fmt.Errorf("resolve plan from subscription: %w", err)
 		}
 	}
@@ -858,6 +868,10 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		until := time.Now().Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
 		lic.ValidUntil = &until
 	}
+	// A subscription's licence is what the subscription is: trialing or
+	// paid, up to the end of its period. Read again once the licence
+	// exists (below); this read stands should that one fail.
+	subscriptionStart(lic, sub)
 	// What the customer bought was a licence of the kind the plan was
 	// then. A plan retyped since — perpetual to subscription or trial
 	// — cannot deliver it: a one-off payment would become a
@@ -1038,12 +1052,14 @@ func (h *StripeHandler) fulfillCheckout(ctx context.Context, email, customerID, 
 		// earlier unpaid completion or a racing worker goes away.
 		_ = h.Store.DeleteProcessedEvent(ctx, pendingSessionProvider, sessionID)
 	}
-	// The new subscription's cancel state is left to SyncCancelStates,
-	// which reads Stripe now that the licence exists. A copy read before
-	// it existed could be stale — a cancellation made in between sends a
-	// webhook that finds no licence yet — and once recorded nothing would
-	// correct it. Until then neither reminder goes out, and both are a
-	// day or more away.
+	// The subscription is read again now that the licence exists. The
+	// read above came before it, and so may every event so far: the
+	// invoice that pays the first period, or a cancellation, finds no
+	// licence and is dropped, and nothing else would bring the licence
+	// in line until the next renewal. Events from here on find it. A
+	// read that fails leaves the cancel state to SyncCancelStates, and
+	// the rest as the read above set it.
+	h.followNewSubscription(ctx, lic)
 
 	// Link license to user
 	if u, err := h.Store.FindUserByEmail(ctx, email); err == nil {
@@ -1120,9 +1136,14 @@ func (h *StripeHandler) VerifyCheckoutSession(c *gin.Context) {
 		return
 	}
 
-	ok, err := h.fulfillSession(c.Request.Context(), sess, "verify")
+	// Once begun, the licence and what tells of it (its email and the
+	// license.created webhook) are seen through even if the buyer closes
+	// the page: nothing else retries what a cancelled request left out.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), webhookWorkTimeout)
+	defer cancel()
+	ok, err := h.fulfillSession(ctx, sess, "verify")
 	if !ok {
-		h.Store.TryRecordProcessedEvent(c, pendingSessionProvider, sess.ID)
+		h.Store.TryRecordProcessedEvent(ctx, pendingSessionProvider, sess.ID)
 	}
 	if err != nil {
 		slog.Warn("stripe verify: transient fulfilment failure", "session_id", sess.ID, "error", err)
@@ -1220,6 +1241,59 @@ func (h *StripeHandler) SubscriptionEnded(ctx context.Context, subscriptionID st
 		return true, nil
 	}
 	return false, nil
+}
+
+// FollowSubscription is for an operator lifting a suspension from a
+// licence on a Stripe subscription. While the licence was suspended, the
+// subscription's writes were refused (see store.ErrLicenseRestricted):
+// a renewal paid, a pause, a payment that failed. Lifting the
+// suspension hands the licence back to the subscription as Stripe has it
+// now.
+//
+// It reads the subscription before the suspension is lifted, so a Stripe
+// that cannot answer leaves the licence suspended, and returns what
+// applies it once lifted: a fresh read, taken then so that a change
+// whose event was refused in between is not missed, or this one should
+// that read fail.
+func (h *StripeHandler) FollowSubscription(ctx context.Context, lic *model.License) (func(context.Context) error, error) {
+	first, firstAsOf, err := h.readForFollow(ctx, lic.StripeSubscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) error {
+		cur, asOf, err := h.readForFollow(ctx, lic.StripeSubscriptionID)
+		if err != nil {
+			slog.Warn("stripe: subscription not read again after the suspension was lifted, applying the earlier read",
+				"license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID, "error", err)
+			cur, asOf = first, firstAsOf
+		}
+		fresh, err := h.Store.FindLicenseByID(ctx, lic.ID)
+		if err != nil {
+			return err
+		}
+		return h.syncFromCurrent(ctx, fresh, cur, asOf, "admin.reinstate")
+	}, nil
+}
+
+// readForFollow reads a subscription for FollowSubscription, after the
+// read stamp it is applied with.
+func (h *StripeHandler) readForFollow(ctx context.Context, subscriptionID string) (*subscriptionEvent, time.Time, error) {
+	asOf, err := h.Store.StripeReadStamp(ctx)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	cur, err := h.currentSubscriptionCtx(ctx, subscriptionID)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if cur == nil {
+		// As for SubscriptionEnded: a key that cannot see the
+		// subscription cannot tell one still billing from one that
+		// ended, nor a paid renewal from a pause.
+		return nil, time.Time{}, apperr.New(409, "STRIPE_NOT_VISIBLE",
+			"Stripe cannot see this license's subscription with the API key this install uses — check that the key belongs to the right account and to the same test/live mode; the license stays suspended until its subscription can be read")
+	}
+	return cur, asOf, nil
 }
 
 // currentSubscription fetches a subscription as Stripe has it now, in the
@@ -2064,6 +2138,9 @@ func (h *StripeHandler) applySubscriptionState(ctx context.Context, lic *model.L
 		// An ended subscription holds no change for payment.
 		lic.StripePendingUpdateExpiresAt = nil
 		cols = append(cols, "stripe_pending_update_expires_at")
+		if endAccessNow(lic) {
+			cols = append(cols, "valid_until")
+		}
 	}
 	if usable {
 		// Usable again lifts a Stripe pause; an operator's suspension
@@ -2269,13 +2346,33 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 	// whose read started before it (and may still have seen "active")
 	// cannot bring the licence back afterwards.
 	lic.StripePendingUpdateExpiresAt = nil
-	if landed, err := h.endLicenseFromSubscription(ctx, lic, "status", "canceled_at", "past_due_at", "stripe_pending_update_expires_at"); !landed {
+	cols := []string{"status", "canceled_at", "past_due_at", "stripe_pending_update_expires_at"}
+	if endAccessNow(lic) {
+		cols = append(cols, "valid_until")
+	}
+	if landed, err := h.endLicenseFromSubscription(ctx, lic, cols...); !landed {
 		return err
 	}
 	if !lic.WasCanceled {
 		h.announceCanceled(ctx, lic, "webhook", "subscription_deleted")
 	}
 	return nil
+}
+
+// endAccessNow brings the expiry of a licence whose subscription ended in
+// to now, and reports whether it moved. Stripe ends a subscription when
+// nothing more is owed: at the end of a period cancelled ahead, at once
+// when someone cancels it now, or when its payment retries run out. A
+// renewal that failed has already moved the period end to the end of
+// the period nobody paid for, so that date is no reason to keep the
+// licence usable. An earlier expiry stays as it is.
+func endAccessNow(lic *model.License) bool {
+	now := time.Now()
+	if lic.ValidUntil != nil && !lic.ValidUntil.After(now) {
+		return false
+	}
+	lic.ValidUntil = &now
+	return true
 }
 
 // onPaymentFailed starts dunning for a failed invoice. A non-nil error
@@ -2979,10 +3076,21 @@ func (h *StripeHandler) CancelSubscription(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), webhookWorkTimeout)
 	defer cancel()
 	if req.Immediate {
-		_, err = subscription.Cancel(lic.StripeSubscriptionID, nil)
-		if err != nil {
-			response.Internal(c, err)
-			return
+		// Stripe answers 404 to cancelling a subscription that already
+		// ended, which is the end asked for. Only Stripe saying so counts:
+		// a key that cannot see a subscription answers the same way.
+		if _, err = subscription.Cancel(lic.StripeSubscriptionID, nil); err != nil {
+			ended, eerr := h.SubscriptionEnded(ctx, lic.StripeSubscriptionID)
+			var ae *apperr.AppError
+			switch {
+			case eerr == nil && ended:
+			case errors.As(eerr, &ae):
+				response.Err(c, ae.Status, ae.Code, ae.Message)
+				return
+			default:
+				response.Internal(c, err)
+				return
+			}
 		}
 		// A licence an upgrade moved onto this subscription goes back to
 		// its free plan, as the deletion would put it: it has not ended,
@@ -3621,16 +3729,16 @@ func (h *StripeHandler) resolvePlanFromLineItems(ctx context.Context, sessionID 
 //
 // quantity is what the subscription bills (see subscriptionQuantity),
 // 1 when Stripe cannot see it.
-func (h *StripeHandler) resolvePlan(ctx context.Context, subID string) (plan *model.Plan, quantity int, err error) {
-	sub, err := subscription.Get(subID, nil)
+func (h *StripeHandler) resolvePlan(ctx context.Context, subID string) (plan *model.Plan, quantity int, sub *stripe.Subscription, err error) {
+	sub, err = subscription.Get(subID, nil)
 	if err != nil {
 		if stripeNotFound(err) {
-			return nil, 1, nil
+			return nil, 1, nil, nil
 		}
-		return nil, 1, err
+		return nil, 1, nil, err
 	}
 	if sub.Items == nil || len(sub.Items.Data) == 0 {
-		return nil, 1, nil
+		return nil, 1, sub, nil
 	}
 	// The item whose price a plan sells: an add-on the seller put on the
 	// subscription next to it says nothing about the licence.
@@ -3640,15 +3748,64 @@ func (h *StripeHandler) resolvePlan(ctx context.Context, subID string) (plan *mo
 		}
 		plan, err = h.planForPrice(ctx, it.Price.ID)
 		if err != nil || plan != nil {
-			return plan, clampQuantity(it.Quantity), err
+			return plan, clampQuantity(it.Quantity), sub, err
 		}
 	}
 	// No item a plan sells: one item is still the seats bought (the plan
 	// comes from the session); with several, which one is unknown.
 	if len(sub.Items.Data) == 1 {
-		return nil, subscriptionQuantity(sub), nil
+		return nil, subscriptionQuantity(sub), sub, nil
 	}
-	return nil, 1, nil
+	return nil, 1, sub, nil
+}
+
+// subscriptionStart sets a new licence from the subscription it is
+// issued for: trialing while the subscription is, and valid to the end
+// of the period it bills. Nothing without a subscription, or a period.
+func subscriptionStart(lic *model.License, sub *stripe.Subscription) {
+	if sub == nil {
+		return
+	}
+	switch sub.Status {
+	case stripe.SubscriptionStatusTrialing:
+		lic.Status = model.StatusTrialing
+	case stripe.SubscriptionStatusActive:
+		lic.Status = model.StatusActive
+	}
+	var end int64
+	if sub.Items != nil {
+		for _, it := range sub.Items.Data {
+			if it != nil && it.CurrentPeriodEnd > end {
+				end = it.CurrentPeriodEnd
+			}
+		}
+	}
+	if end > 0 {
+		until := time.Unix(end, 0)
+		lic.ValidUntil = &until
+	}
+}
+
+// followNewSubscription applies the subscription, read now, to the
+// licence just issued for it (see fulfillCheckout). Best effort: the
+// licence is issued either way.
+func (h *StripeHandler) followNewSubscription(ctx context.Context, lic *model.License) {
+	if lic.StripeSubscriptionID == "" {
+		return
+	}
+	asOf, err := h.Store.StripeReadStamp(ctx)
+	if err != nil {
+		slog.Warn("stripe checkout: new licence not read against its subscription", "license_id", lic.ID, "error", err)
+		return
+	}
+	cur, err := h.currentSubscriptionCtx(ctx, lic.StripeSubscriptionID)
+	if err != nil || cur == nil {
+		slog.Warn("stripe checkout: new licence not read against its subscription", "license_id", lic.ID, "error", err)
+		return
+	}
+	if err := h.syncFromCurrent(ctx, lic, cur, asOf, "checkout.session.completed"); err != nil {
+		slog.Warn("stripe checkout: new licence not brought in line with its subscription", "license_id", lic.ID, "error", err)
+	}
 }
 
 // planForPrice distinguishes "no plan uses this price" from a

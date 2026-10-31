@@ -3687,6 +3687,12 @@ paths:
         `license.reinstated` with that status. An expired or canceled
         license whose expiry has passed needs a new expiry instead (`POST
         /admin/licenses/{id}/valid-until`). No request body.
+
+        A license on a Stripe subscription goes back to the subscription
+        as Stripe has it now: Stripe's changes are not applied to a
+        suspended license, so a renewal paid, a pause or the end of the
+        subscription meanwhile is applied when it is reinstated. Stripe is
+        read first; when it cannot be read, the license stays suspended.
       x-required-scopes: [admin, "licenses:write"]
       security:
         - BearerAuth: []
@@ -3707,7 +3713,10 @@ paths:
                     properties:
                       status:
                         type: string
-                        description: The status the license now has
+                        description: |
+                          The status the license now has: for a license on a Stripe
+                          subscription, as the subscription leaves it (`suspended`
+                          for one Stripe paused, `canceled` for one that ended)
                       usable:
                         type: boolean
                         description: |
@@ -3715,7 +3724,8 @@ paths:
                           expiry and grace ran out while it was suspended is
                           reinstated but still does not work: the next expiry check
                           expires it (or returns an upgraded one to its free plan).
-                          Absent when the license could not be read back.
+                          One on a Stripe subscription works as the subscription
+                          allows. Absent when the license could not be read back.
                       notice:
                         type: string
                         description: When `usable` is false, what brings the license back
@@ -3729,10 +3739,17 @@ paths:
         "404":
           $ref: "#/components/responses/AdminLicenseNotFound"
         "409":
-          description: "`EXPIRY_PASSED`: set a new expiry date instead, which reactivates it"
+          description: |
+            `EXPIRY_PASSED`: set a new expiry date instead, which reactivates it.
+            `STRIPE_NOT_VISIBLE`: the install's Stripe API key cannot see the
+            license's subscription (another account, or the other test/live
+            mode); the license stays suspended
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "429":
           $ref: "#/components/responses/RateLimited"
+        "502":
+          description: "`STRIPE_UNAVAILABLE`: Stripe could not be reached to read the license's subscription; the license stays suspended"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
 
   /admin/licenses/{id}/quantity:
     post:

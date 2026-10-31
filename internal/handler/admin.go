@@ -56,6 +56,12 @@ type AdminHandler struct {
 	// upgrade put it on that subscription (reverted true). Wired in
 	// main like SubscriptionEnded, and nil without Stripe.
 	CancelSubscription func(ctx context.Context, lic *model.License) (reverted bool, err error)
+	// FollowSubscription reads a licence's Stripe subscription before
+	// ReinstateLicense lifts an operator's suspension, and returns what
+	// writes the subscription's state to the licence once it is lifted:
+	// Stripe's changes were refused while it was suspended. Wired in
+	// main like SubscriptionEnded, and nil without Stripe.
+	FollowSubscription func(ctx context.Context, lic *model.License) (func(context.Context) error, error)
 	// beforeCutoffWrite runs between reading a license (and the plan
 	// or product it points at), or the plans a plan write checks, and
 	// the transaction that writes it.
@@ -3152,6 +3158,31 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 	if !h.checkLicenseScope(c, id) {
 		return
 	}
+	// A licence on a Stripe subscription goes back to the subscription
+	// as Stripe has it now; read first, so a Stripe that cannot answer
+	// leaves it suspended rather than usable on what it was before. A
+	// licence that cannot be read is not reinstated either, as whether it
+	// has a subscription is not known; one that does not exist is the
+	// store's to refuse.
+	var follow func(context.Context) error
+	lic, err := h.Store.FindLicenseByID(c, id)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		response.Internal(c, err)
+		return
+	}
+	if err == nil && lic.StripeSubscriptionID != "" && h.FollowSubscription != nil {
+		if follow, err = h.FollowSubscription(c, lic); err != nil {
+			var ae *apperr.AppError
+			if errors.As(err, &ae) {
+				response.Err(c, ae.Status, ae.Code, ae.Message)
+				return
+			}
+			response.LogInternal(c, err)
+			response.Err(c, http.StatusBadGateway, "STRIPE_UNAVAILABLE",
+				"Stripe could not be reached to read this license's subscription; the license stays suspended — try again in a moment")
+			return
+		}
+	}
 	status, err := h.Store.ReinstateLicense(c, id)
 	if errors.Is(err, store.ErrReinstateNeedsNewExpiry) {
 		response.Conflict(c, "EXPIRY_PASSED", err.Error(), nil)
@@ -3166,28 +3197,46 @@ func (h *AdminHandler) ReinstateLicense(c *gin.Context) {
 		ActorType: "admin", ActorID: adminID(c),
 		Changes: map[string]any{"status": status},
 	})
+	if lic, err := h.Store.FindLicenseByID(c, id); err == nil && h.Webhook != nil {
+		h.Webhook.Dispatch(c, lic.ProductID, "license.reinstated", map[string]any{
+			"license_id": id, "email": lic.Email, "status": status,
+		})
+	}
+	// Then the subscription, which tells what it changes itself: a pause
+	// Stripe made meanwhile, or the end of the subscription.
+	followed := follow == nil
+	if follow != nil {
+		if err := follow(c); err != nil {
+			slog.Warn("reinstate: subscription not applied to the license", "license_id", id, "error", err)
+		} else {
+			followed = true
+		}
+	}
 	// usable only when it was looked at: not claimed for a licence that
 	// could not be read back.
 	out := gin.H{"status": status}
 	if lic, err := h.Store.FindLicenseByID(c, id); err == nil {
+		out["status"] = lic.Status
 		out["usable"] = true
-		if h.Webhook != nil {
-			h.Webhook.Dispatch(c, lic.ProductID, "license.reinstated", map[string]any{
-				"license_id": id, "email": lic.Email, "status": status,
-			})
-		}
 		// Reinstating lifts the suspension and nothing else: a licence
 		// whose expiry and grace ran out while it was suspended goes on
 		// as one that lapsed, and the next expiry check expires it (or
-		// returns an upgraded one to its free plan). Its status reads
-		// "active" until then, so the answer says plainly that it does
-		// not work, and what brings it back.
+		// returns an upgraded one to its free plan); one on a Stripe
+		// subscription is as the subscription is. The answer says
+		// plainly when it does not work, and what brings it back.
 		if !service.IsLicenseUsable(lic) {
 			out["usable"] = false
-			if lic.StripeSubscriptionID != "" {
-				out["notice"] = "its expiry date passed while it was suspended, so it is not usable: its Stripe subscription sets a new expiry when it is paid"
-			} else {
+			switch {
+			case lic.StripeSubscriptionID == "":
 				out["notice"] = "its expiry date passed while it was suspended, so it is not usable: set a new expiry date to keep it"
+			case !followed:
+				out["notice"] = "its Stripe subscription could not be applied to it, so it is not usable for now: the subscription's next change in Stripe sets it"
+			case lic.Status == model.StatusSuspended:
+				out["notice"] = "its Stripe subscription is paused, so it is not usable: it is again when the subscription resumes"
+			case lic.Status == model.StatusCanceled:
+				out["notice"] = "its Stripe subscription has ended, so it is not usable"
+			default:
+				out["notice"] = "its Stripe subscription is not paid up, so it is not usable: it is again when the subscription is paid"
 			}
 		}
 	}
@@ -3810,10 +3859,10 @@ func (h *AdminHandler) ListAnalytics(c *gin.Context) {
 	granularity := c.Query("granularity")
 	var from, to time.Time
 	if v := c.Query("from"); v != "" {
-		from, _ = time.Parse("2006-01-02", v)
+		from, _ = parseDay(v)
 	}
 	if v := c.Query("to"); v != "" {
-		to, _ = time.Parse("2006-01-02", v)
+		to, _ = parseDay(v)
 	}
 	if from.IsZero() {
 		from = time.Now().AddDate(0, -1, 0)
@@ -3853,7 +3902,7 @@ func analyticsFilter(c *gin.Context) store.AnalyticsFilter {
 		Status:      c.Query("status"),
 	}
 	if v := c.Query("from"); v != "" {
-		f.From, _ = time.Parse("2006-01-02", v)
+		f.From, _ = parseDay(v)
 	}
 	if v := c.Query("to"); v != "" {
 		if t, ok := endOfDay(v); ok {
@@ -3869,11 +3918,22 @@ func analyticsFilter(c *gin.Context) store.AnalyticsFilter {
 // microsecond, the precision bun writes times at and Postgres keeps, so
 // the bound compared is exactly this value.
 func endOfDay(v string) (time.Time, bool) {
-	t, err := time.Parse("2006-01-02", v)
-	if err != nil {
+	t, ok := parseDay(v)
+	if !ok {
 		return time.Time{}, false
 	}
 	return t.Add(24*time.Hour - time.Microsecond), true
+}
+
+// parseDay parses a YYYY-MM-DD date for the analytics filters, which
+// ignore one that does not parse. Years 1 to 9999 only: Go takes year 0,
+// Postgres has none, and a query given it failed as an internal error.
+func parseDay(v string) (time.Time, bool) {
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil || t.Year() < 1 {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 func (h *AdminHandler) AnalyticsSummary(c *gin.Context) {
@@ -3903,7 +3963,7 @@ func (h *AdminHandler) AnalyticsUsageTop(c *gin.Context) {
 	productID := c.Query("product_id")
 	var from, to time.Time
 	if v := c.Query("from"); v != "" {
-		from, _ = time.Parse("2006-01-02", v)
+		from, _ = parseDay(v)
 	}
 	if v := c.Query("to"); v != "" {
 		// Usage is compared by timestamp: a midnight bound would drop the
@@ -3923,7 +3983,7 @@ func (h *AdminHandler) AnalyticsActivationTrend(c *gin.Context) {
 	productID := c.Query("product_id")
 	var from, to time.Time
 	if v := c.Query("from"); v != "" {
-		from, _ = time.Parse("2006-01-02", v)
+		from, _ = parseDay(v)
 	}
 	if v := c.Query("to"); v != "" {
 		// A midnight bound would drop every activation made on the "to"

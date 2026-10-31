@@ -231,9 +231,10 @@ func TestInvoicePaidFollowsTheCurrentSubscription(t *testing.T) {
 		t.Fatalf("unpaid subscription paid up: %s %v, want active until the period end", st, vu)
 	}
 
+	// Ended in Stripe: the licence ends now, not at a date still ahead.
 	paid(ended)
-	if st, vu := state(ended); st != model.StatusCanceled || !vu.Equal(until) {
-		t.Fatalf("ended subscription: %s %v, want canceled and the date untouched", st, vu)
+	if st, vu := state(ended); st != model.StatusCanceled || vu.After(time.Now()) {
+		t.Fatalf("ended subscription: %s %v, want canceled and no longer valid", st, vu)
 	}
 
 	paid(trial)

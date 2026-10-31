@@ -928,7 +928,9 @@ const zh = {
   "licenses.updatesUntil": "更新至",
   "licenses.maintenanceDisabled": "维护期功能尚未启用。请在所有服务器都升级到这个版本后，到设置中开启。",
   "licenses.reinstatedLapsed": "已恢复，但它的到期日在暂停期间已过，目前仍不可用。请设置新的到期日。",
-  "licenses.reinstatedLapsedStripe": "已恢复，但它的到期日在暂停期间已过，Stripe 订阅付款后才会恢复可用。",
+  "licenses.reinstatedStripePaused": "已恢复，但它的 Stripe 订阅处于暂停状态，订阅恢复后才可用。",
+  "licenses.reinstatedStripeEnded": "已恢复，但它的 Stripe 订阅已经结束，不再可用。",
+  "licenses.reinstatedStripeUnpaid": "已恢复，但它的 Stripe 订阅尚未付清，付款后才可用。",
   "licenses.updatesUntilEdit": "编辑更新期",
   "licenses.updatesUntilClear": "留空表示永久更新。",
 

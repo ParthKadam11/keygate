@@ -99,3 +99,124 @@ func TestServedKeyForAnUploadWithoutExtension(t *testing.T) {
 		t.Fatalf("upload key from the served one = %q, want %q", got, upload)
 	}
 }
+
+// An upload made again after the release went out is removed when its
+// finalize is refused; the file the release serves is not, even when it
+// sits at the upload key (an artifact finalized before served copies).
+func TestFinalizeAfterPublishRemovesOnlyTheStrayUpload(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
+	}
+	s, err := store.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	suffix := time.Now().Format("150405.000000000")
+	prod := &model.Product{Name: "Late " + suffix, Slug: "late-up-" + suffix, Type: "desktop"}
+	if err := s.CreateProduct(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFakeStorage()
+	svc := NewReleaseService(ReleaseServiceConfig{Store: s, Storage: fs, Logger: slog.Default()})
+	release := func(version string) (*model.Release, *AddArtifactResult) {
+		t.Helper()
+		rel := &model.Release{ProductID: prod.ID, Version: version, Channel: model.ReleaseChannelStable}
+		if err := s.CreateRelease(ctx, rel); err != nil {
+			t.Fatal(err)
+		}
+		added, err := svc.AddArtifact(ctx, AddArtifactInput{ReleaseID: rel.ID, Platform: "darwin-arm64", Filename: "App.dmg"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rel, added
+	}
+	publish := func(rel *model.Release) {
+		t.Helper()
+		if _, err := s.DB.NewRaw("UPDATE releases SET status = 'published', published_at = now() WHERE id = ?", rel.ID).Exec(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rel, added := release("1.0.0")
+	upload := added.Artifact.FileKey
+	fs.objects[upload] = []byte("build")
+	served, err := svc.FinalizeArtifact(ctx, FinalizeArtifactInput{ArtifactID: added.Artifact.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publish(rel)
+	fs.objects[upload] = []byte("uploaded again")
+	if _, err := svc.FinalizeArtifact(ctx, FinalizeArtifactInput{ArtifactID: added.Artifact.ID}); err == nil {
+		t.Fatal("finalize after publish succeeded")
+	}
+	if _, ok := fs.objects[upload]; ok {
+		t.Error("the upload made after publish was left behind")
+	}
+	if !bytes.Equal(fs.objects[served.FileKey], []byte("build")) {
+		t.Error("the served file changed")
+	}
+
+	// Finalized before served copies: the upload key is what it serves.
+	legacy, added := release("1.0.1")
+	legacyKey := added.Artifact.FileKey
+	fs.objects[legacyKey] = []byte("legacy build")
+	if _, err := s.DB.NewRaw(`UPDATE release_artifacts SET sha256 = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef', file_size = 12 WHERE id = ?`, added.Artifact.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	publish(legacy)
+	if _, err := svc.FinalizeArtifact(ctx, FinalizeArtifactInput{ArtifactID: added.Artifact.ID}); err == nil {
+		t.Fatal("finalize of a published legacy artifact succeeded")
+	}
+	if !bytes.Equal(fs.objects[legacyKey], []byte("legacy build")) {
+		t.Fatal("the file a legacy artifact serves was removed")
+	}
+}
+
+// A draft uploaded under an older key scheme, never finalized, is
+// finalized from the key its upload was made to, which is the key it
+// records.
+func TestFinalizeAnUploadUnderAnOlderKey(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("skipping integration test: TEST_DATABASE_URL not set")
+	}
+	s, err := store.New(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	suffix := time.Now().Format("150405.000000000")
+	prod := &model.Product{Name: "Slug " + suffix, Slug: "slug-" + suffix, Type: "desktop"}
+	if err := s.CreateProduct(ctx, prod); err != nil {
+		t.Fatal(err)
+	}
+	rel := &model.Release{ProductID: prod.ID, Version: "1.0.0", Channel: model.ReleaseChannelStable}
+	if err := s.CreateRelease(ctx, rel); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFakeStorage()
+	svc := NewReleaseService(ReleaseServiceConfig{Store: s, Storage: fs, Logger: slog.Default()})
+	added, err := svc.AddArtifact(ctx, AddArtifactInput{ReleaseID: rel.ID, Platform: "darwin-arm64", Filename: "App.dmg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := "releases/" + prod.Slug + "/1.0.0/darwin-arm64.dmg"
+	if _, err := s.DB.NewRaw("UPDATE release_artifacts SET file_key = ? WHERE id = ?", old, added.Artifact.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fs.objects[old] = []byte("uploaded before the upgrade")
+	got, err := svc.FinalizeArtifact(ctx, FinalizeArtifactInput{ArtifactID: added.Artifact.ID})
+	if err != nil {
+		t.Fatalf("finalize of an upload under the older key = %v", err)
+	}
+	if !bytes.Equal(fs.objects[got.FileKey], []byte("uploaded before the upgrade")) {
+		t.Fatalf("served %q, want the bytes uploaded to the older key", fs.objects[got.FileKey])
+	}
+	if _, ok := fs.objects[old]; ok {
+		t.Error("the upload under the older key was left behind")
+	}
+}

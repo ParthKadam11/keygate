@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -143,6 +145,11 @@ func (m *MeteredBillingSyncer) TryRunOnce(ctx context.Context, limit int) (pushe
 	// every push fail slowly (the client's own retries), and a pass that
 	// went on through a backlog of thousands would hold the lock, and an
 	// admin's request, for hours. What is left goes with the next pass.
+	// Only Stripe failing as a whole counts (no answer, 5xx, 429, the key
+	// refused): a row Stripe refuses on its own merits is skipped, or a
+	// run of one customer's refused rows at the head of the queue would
+	// hold every other customer's usage back each pass until their
+	// retries ran out.
 	var last *model.MeteredBilling
 	failedInARow := 0
 	for ctx.Err() == nil && failedInARow < meteredFailuresEndPass {
@@ -168,14 +175,22 @@ func (m *MeteredBillingSyncer) TryRunOnce(ctx context.Context, limit int) (pushe
 				// does NOT touch attempts; RecordMeteredSyncFailure
 				// owns it. Without this split the counter doubled.
 				_ = m.store.RecordMeteredSyncFailure(ctx, row.ID, err.Error())
+				var refused *rowRefusedError
+				if errors.As(err, &refused) {
+					// About this row alone: the next may well go through.
+					continue
+				}
 				if failedInARow++; failedInARow >= meteredFailuresEndPass {
 					m.logger.Warn("metered: pushes keep failing; ending this pass", "failed_in_a_row", failedInARow)
 					break
 				}
 				continue
 			}
-			failedInARow = 0
+			// Only a push Stripe took ends a run of failures: a row
+			// drained without asking Stripe (no customer, no meter) says
+			// nothing about whether it is back.
 			if sent {
+				failedInARow = 0
 				pushed++
 			}
 		}
@@ -248,6 +263,9 @@ func (m *MeteredBillingSyncer) syncOne(ctx context.Context, row *model.MeteredBi
 		Timestamp:  row.CreatedAt,
 	})
 	if err != nil {
+		if rowRefused(err) {
+			return false, &rowRefusedError{classifyStripeError(err)}
+		}
 		return false, classifyStripeError(err)
 	}
 	if externalID == "" {
@@ -257,6 +275,34 @@ func (m *MeteredBillingSyncer) syncOne(ctx context.Context, row *model.MeteredBi
 		return false, err
 	}
 	return true, nil
+}
+
+// rowRefusedError is a push Stripe answered and refused for this row
+// itself (a customer it does not know, a meter gone; see rowRefused).
+// Unlike Stripe being unreachable, failing, throttling or refusing the
+// account's key, it says nothing about the rows after it, so it does
+// not count towards ending the pass (see meteredFailuresEndPass).
+type rowRefusedError struct{ err error }
+
+func (e *rowRefusedError) Error() string { return e.err.Error() }
+func (e *rowRefusedError) Unwrap() error { return e.err }
+
+// rowRefused reports whether Stripe answered err as about this request
+// alone: 400 (a parameter it rejects, such as a customer it does not
+// know), 404, 409 or 422. Everything else is about the account or the
+// service and holds for every row: 401 and 403 (the key missing,
+// revoked, rotated or short of a permission), 402, 429, 5xx, and no
+// answer at all.
+func rowRefused(err error) bool {
+	var se *stripe.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.HTTPStatusCode {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
 }
 
 // classifyStripeError keeps the error message compact for the

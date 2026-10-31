@@ -409,3 +409,26 @@ func TestPublishOfAPublishedReleaseSaysSo(t *testing.T) {
 		t.Fatalf("publishing a published release = %v, want ErrReleaseNotPublishable", err)
 	}
 }
+
+// Each replacement reports the key it replaced, as stored when it took
+// the release lock: of two finalizes, the second is told of the first's
+// copy, not of the key both read before either wrote.
+func TestReplaceArtifactFileReportsWhatItReplaced(t *testing.T) {
+	s := setupTestDB(t)
+	defer s.Close()
+	ctx := context.Background()
+	_, artID := setupSignedDraft(t, s, ctx, false)
+	before, err := s.FindArtifact(ctx, artID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := "aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999"
+	first, err := s.ReplaceArtifactFile(ctx, artID, "releases/x/first.dmg", 1, sha, "application/octet-stream")
+	if err != nil || first != before.FileKey {
+		t.Fatalf("first replacement = %q, %v; want %q", first, err, before.FileKey)
+	}
+	second, err := s.ReplaceArtifactFile(ctx, artID, "releases/x/second.dmg", 1, sha, "application/octet-stream")
+	if err != nil || second != "releases/x/first.dmg" {
+		t.Fatalf("second replacement = %q, %v; want the first one's key", second, err)
+	}
+}

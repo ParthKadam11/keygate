@@ -357,11 +357,11 @@ func TestSubscriptionUpdatedUsesCurrentState(t *testing.T) {
 	}
 }
 
-// A subscription checkout leaves the new subscription's cancel state to
-// the background sync, which reads Stripe once the licence exists — a
-// copy read during fulfilment could predate a cancellation whose webhook
-// found no licence yet. The sync then records it.
-func TestFulfillCheckout_LeavesCancelStateToSync(t *testing.T) {
+// A subscription checkout records the new subscription's cancel state
+// from a read taken once the licence exists, never from the copy read
+// before it, which could predate a cancellation whose webhook found no
+// licence yet. The background sync reads and records the same.
+func TestFulfillCheckout_ReadsCancelStateOnceIssued(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
 	suffix := time.Now().Format("150405.000000")
@@ -403,8 +403,10 @@ func TestFulfillCheckout_LeavesCancelStateToSync(t *testing.T) {
 		WHERE license_id = ? AND cancel_state_synced_at IS NOT NULL)`, lic.ID).Scan(ctx, &synced); err != nil {
 		t.Fatal(err)
 	}
-	if synced {
-		t.Fatal("fulfilment recorded a cancel state; it is the sync's to record")
+	// Read once the licence existed: the cancellation Stripe has is
+	// recorded by fulfilment, and the sync reads the same.
+	if !synced {
+		t.Fatal("fulfilment did not record the cancel state it read after issuing the licence")
 	}
 
 	if !h.syncCancelState(ctx, store.StripeCancelStateTarget{LicenseID: lic.ID, SubscriptionID: subID}) {

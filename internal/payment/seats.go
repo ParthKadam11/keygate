@@ -28,10 +28,20 @@ import (
 // caller named none), which the buyer can still change on Stripe's page
 // within the plan's range. requested is 0 when no quantity was named.
 // Only a subscription is sold per seat; a one-time checkout is one unit.
-func checkoutLineItem(plan *model.Plan, priceID string, subscription bool, requested int) (*stripe.CheckoutSessionLineItemParams, error) {
+// A metered price (see priceMetered) bills the usage reported to its
+// meter: Stripe refuses a quantity for it, so it carries none, and it is
+// not sold per seat.
+func checkoutLineItem(plan *model.Plan, priceID string, subscription, metered bool, requested int) (*stripe.CheckoutSessionLineItemParams, error) {
 	item := &stripe.CheckoutSessionLineItemParams{Price: stripe.String(priceID), Quantity: stripe.Int64(1)}
 	if requested < 0 {
 		return nil, errors.New("quantity must be 1 or more")
+	}
+	if metered {
+		if plan.PerSeat || requested > 1 {
+			return nil, errors.New("this plan is billed by usage, not sold per seat")
+		}
+		item.Quantity = nil
+		return item, nil
 	}
 	if !plan.PerSeat || !subscription {
 		if requested > 1 {
@@ -55,6 +65,12 @@ func checkoutLineItem(plan *model.Plan, priceID string, subscription bool, reque
 		}
 	}
 	return item, nil
+}
+
+// priceMetered reports whether a price bills the usage reported to a
+// meter rather than a quantity.
+func priceMetered(p *stripe.Price) bool {
+	return p != nil && p.Recurring != nil && p.Recurring.UsageType == stripe.PriceRecurringUsageTypeMetered
 }
 
 // subscriptionQuantity is the quantity Stripe bills on a subscription's

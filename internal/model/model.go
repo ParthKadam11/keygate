@@ -1080,9 +1080,9 @@ type MeteredBilling struct {
 	Synced        bool       `bun:",notnull,default:false" json:"synced"`
 	SyncedAt      *time.Time `json:"synced_at,omitempty"`
 	ExternalID    string     `json:"external_id,omitempty"`
-	// Attempts increments on every push to Stripe (success OR
-	// failure). LastError records the most recent failure message
-	// so operators can debug stuck rows without tailing logs.
+	// Attempts counts the pushes to Stripe that failed. LastError
+	// records the most recent failure message so operators can debug
+	// stuck rows without tailing logs.
 	Attempts  int       `bun:",notnull,default:0" json:"attempts"`
 	LastError string    `bun:",notnull,default:''" json:"last_error,omitempty"`
 	CreatedAt time.Time `bun:",nullzero,default:now()" json:"created_at"`

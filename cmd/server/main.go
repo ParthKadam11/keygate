@@ -453,6 +453,7 @@ func main() {
 	if cfg.StripeSecretKey != "" {
 		adminH.SubscriptionEnded = stripeH.SubscriptionEnded
 		adminH.CancelSubscription = stripeH.CancelForAdmin
+		adminH.FollowSubscription = stripeH.FollowSubscription
 	}
 	// Recorded across replicas and across restarts: links signed
 	// before this start keep the lifetime they were signed with, so

@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	stripe "github.com/stripe/stripe-go/v82"
 
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
@@ -411,5 +414,83 @@ func TestMeteredSync_RunOfFailuresEndsThePass(t *testing.T) {
 	tt.syncer.RunOnce(ctx, 5)
 	if tries != meteredFailuresEndPass {
 		t.Fatalf("pushes tried with Stripe down = %d, want the pass to end after %d", tries, meteredFailuresEndPass)
+	}
+}
+
+// A run of rows Stripe refuses on their own merits (a customer it does
+// not know) does not end the pass: the rows behind them, other
+// customers' usage, are still sent in the same pass.
+func TestMeteredSync_RefusedRowsDoNotHoldTheQueue(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	gone, _ := seedMeteredLicense(t, tt.store, ctx, "ev_gone", "cus_gone")
+	good, _ := seedMeteredLicense(t, tt.store, ctx, "ev_good", "cus_good")
+	for range 30 {
+		if err := tt.store.InsertMeteredEvent(ctx, gone.ID, "api_calls", "2026-05", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 20 {
+		if err := tt.store.InsertMeteredEvent(ctx, good.ID, "api_calls", "2026-05", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tt.syncer.dispatch = func(ctx context.Context, in stripeMeterEvent) (string, error) {
+		if in.CustomerID == "cus_gone" {
+			return "", &stripe.Error{HTTPStatusCode: http.StatusBadRequest, Msg: "No such customer"}
+		}
+		return tt.dispatch(ctx, in)
+	}
+	if pushed := tt.syncer.RunOnce(ctx, 10); pushed != 20 {
+		t.Fatalf("pushed %d in one pass, want the good customer's 20 behind the refused 30", pushed)
+	}
+}
+
+// The account's key refused (401, or 403 for a restricted key short of a
+// permission) is Stripe refusing every row, not this one: it ends the
+// pass after a run, rather than spending every queued row's retries.
+func TestMeteredSync_KeyRefusedEndsThePass(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		tt, ctx := setupMeteredTest(t)
+		lic, _ := seedMeteredLicense(t, tt.store, ctx, "ev_key", "cus_key")
+		for range 30 {
+			if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-05", 1); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tries := 0
+		tt.syncer.dispatch = func(context.Context, stripeMeterEvent) (string, error) {
+			tries++
+			return "", &stripe.Error{HTTPStatusCode: status, Msg: "Invalid API Key provided"}
+		}
+		tt.syncer.RunOnce(ctx, 5)
+		if tries != meteredFailuresEndPass {
+			t.Errorf("status %d: pushes tried = %d, want the pass to end after %d", status, tries, meteredFailuresEndPass)
+		}
+	}
+}
+
+// Rows drained without asking Stripe (no customer) do not end a run of
+// Stripe failures: with Stripe down the pass still ends after a run.
+func TestMeteredSync_DrainedRowsDoNotResetTheRun(t *testing.T) {
+	tt, ctx := setupMeteredTest(t)
+	billed, _ := seedMeteredLicense(t, tt.store, ctx, "ev_mixed", "cus_mixed")
+	unbilled, _ := seedMeteredLicense(t, tt.store, ctx, "ev_none", "")
+	for i := range 60 {
+		lic := billed
+		if i%5 == 4 {
+			lic = unbilled
+		}
+		if err := tt.store.InsertMeteredEvent(ctx, lic.ID, "api_calls", "2026-05", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tries := 0
+	tt.syncer.dispatch = func(context.Context, stripeMeterEvent) (string, error) {
+		tries++
+		return "", errors.New("stripe: unreachable")
+	}
+	tt.syncer.RunOnce(ctx, 7)
+	if tries != meteredFailuresEndPass {
+		t.Fatalf("pushes tried with Stripe down = %d, want %d despite the drained rows between them", tries, meteredFailuresEndPass)
 	}
 }

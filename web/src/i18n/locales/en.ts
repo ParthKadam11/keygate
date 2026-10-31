@@ -968,8 +968,11 @@ const en = {
     "Maintenance-period features are switched off. Enable them in Settings once every server runs this version.",
   "licenses.reinstatedLapsed":
     "Reinstated, but its expiry date passed while it was suspended, so it still does not work. Set a new expiry date to keep it.",
-  "licenses.reinstatedLapsedStripe":
-    "Reinstated, but its expiry date passed while it was suspended, so it does not work until its Stripe subscription is paid.",
+  "licenses.reinstatedStripePaused":
+    "Reinstated, but its Stripe subscription is paused, so it does not work until the subscription resumes.",
+  "licenses.reinstatedStripeEnded": "Reinstated, but its Stripe subscription has ended, so it does not work.",
+  "licenses.reinstatedStripeUnpaid":
+    "Reinstated, but its Stripe subscription is not paid up, so it does not work until the subscription is paid.",
   "licenses.updatesUntilEdit": "Edit update period",
   "licenses.updatesUntilClear": "Leave empty for lifetime updates.",
 

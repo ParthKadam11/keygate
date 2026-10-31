@@ -542,9 +542,15 @@ function LicenseDetail({ id, onClose }: { id: string; onClose: () => void }) {
     mutationFn: () => admin.reinstateLicense(id),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["admin"] })
-      // Reinstated, but its expiry ran out while it was suspended.
-      if (res && res.usable === false)
-        showToast(t(lic?.stripe_subscription_id ? "licenses.reinstatedLapsedStripe" : "licenses.reinstatedLapsed"))
+      // Reinstated, but not usable: its expiry ran out while it was
+      // suspended, or its Stripe subscription, which it now follows, is
+      // paused, ended or unpaid.
+      if (res && res.usable === false) {
+        if (!lic?.stripe_subscription_id) showToast(t("licenses.reinstatedLapsed"))
+        else if (res.status === "suspended") showToast(t("licenses.reinstatedStripePaused"))
+        else if (res.status === "canceled") showToast(t("licenses.reinstatedStripeEnded"))
+        else showToast(t("licenses.reinstatedStripeUnpaid"))
+      }
     },
     onError: (e: Error) => showToast(e.message, "error"),
   })

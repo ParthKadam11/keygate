@@ -60,6 +60,12 @@ func TestDevLoginOnlyFromThisMachine(t *testing.T) {
 			t.Errorf("providers through a local proxy (%s) = %s, want dev_login false", name, w.Body.String())
 		}
 	}
+	// An address of any length would ride in the session token.
+	long := httptest.NewRequest(http.MethodPost, "/dev-login", strings.NewReader(`{"email":"`+strings.Repeat("a", 70000)+`@example.com"}`))
+	long.RemoteAddr, long.Host = "127.0.0.1:51000", "localhost:9000"
+	if w := httptest.NewRecorder(); func() int { r.ServeHTTP(w, long); return w.Code }() != http.StatusBadRequest {
+		t.Errorf("dev-login with a 70000-character address = %d, want 400", w.Code)
+	}
 	for _, host := range []string{"127.0.0.1:9000", "[::1]:9000", "app.localhost:5173", "localhost"} {
 		if w := callAs(http.MethodGet, "/providers", "127.0.0.1:51000", host, nil); !strings.Contains(w.Body.String(), `"dev_login":true`) {
 			t.Errorf("providers for host %s = %s, want dev_login true", host, w.Body.String())

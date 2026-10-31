@@ -414,9 +414,19 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 	// from there, the file could be replaced after it was hashed,
 	// signed and published, by anyone holding the URL. So the upload is
 	// copied, inside the store, to a key no URL was ever issued for,
-	// and that copy is what is hashed and served. The upload key is
-	// the one AddArtifact built (the extension is the copy's own).
-	uploadKey := buildFileKey(rel.ProductID, a.Platform, rel.Version, a.FileKey)
+	// and that copy is what is hashed and served.
+	//
+	// The upload key is the one AddArtifact built and the presigned URL
+	// points at. Never finalized, the artifact still records it as its
+	// file key, which is also what an upload made under an older key
+	// scheme (v0.1.1 to v0.1.3 named the product by slug) still points
+	// at. Finalized, its file key is the served copy, and the upload key
+	// is built again as AddArtifact builds it (the extension is the
+	// copy's own).
+	uploadKey := a.FileKey
+	if a.SHA256 != "" {
+		uploadKey = buildFileKey(rel.ProductID, a.Platform, rel.Version, a.FileKey)
+	}
 	info, err := s.storage.Head(ctx, uploadKey)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotFound) {
@@ -476,9 +486,17 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 		contentType = "application/octet-stream"
 	}
 
-	if err := s.store.UpdateArtifactFile(ctx, a.ID, servedKey, info.Size, computed, contentType); err != nil {
+	replaced, err := s.store.ReplaceArtifactFile(ctx, a.ID, servedKey, info.Size, computed, contentType)
+	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrReleaseNotPublishable):
+			// Uploaded again after the release went out: nothing will
+			// take it, so it goes. Not when it is what the release
+			// serves, as for an artifact finalized before served copies,
+			// whose upload key is its file key.
+			if uploadKey != a.FileKey {
+				s.deleteObject(uploadKey)
+			}
 			return nil, apperr.New(409, "RELEASE_NOT_DRAFT", "artifact's release is no longer draft")
 		case errors.Is(err, store.ErrArtifactNotFound):
 			return nil, apperr.New(404, "ARTIFACT_NOT_FOUND", "artifact not found")
@@ -487,15 +505,20 @@ func (s *ReleaseService) FinalizeArtifact(ctx context.Context, in FinalizeArtifa
 		}
 	}
 	recorded = true
-	// The upload is copied; a copy an earlier finalize of this draft
-	// made is replaced. Neither is referenced any more.
+	// The upload is copied; the copy this write replaced (an earlier
+	// finalize's, read under the lock, see ReplaceArtifactFile) is not
+	// referenced any more. Neither is the upload.
 	s.deleteObject(uploadKey)
-	if a.FileKey != uploadKey && a.FileKey != servedKey {
-		s.deleteObject(a.FileKey)
+	if replaced != uploadKey && replaced != servedKey {
+		s.deleteObject(replaced)
 	}
 
 	out, err := s.store.FindArtifact(ctx, a.ID)
 	if err != nil {
+		if errors.Is(err, store.ErrArtifactNotFound) {
+			// Deleted right after this finalize recorded it.
+			return nil, apperr.New(404, "ARTIFACT_NOT_FOUND", "artifact not found")
+		}
 		return nil, apperr.Internal(err)
 	}
 	return out, nil

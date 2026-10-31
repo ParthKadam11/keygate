@@ -730,9 +730,20 @@ func (s *Store) FindArtifactByPlatform(ctx context.Context, releaseID, platform 
 // sign-then-publish window would race the publisher into shipping an
 // empty-sig artifact.
 func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size int64, sha256, contentType string) error {
+	_, err := s.ReplaceArtifactFile(ctx, id, fileKey, size, sha256, contentType)
+	return err
+}
+
+// ReplaceArtifactFile is UpdateArtifactFile, and returns the file key the
+// artifact pointed at until this write, read under the release lock, so
+// the caller removes the object this write replaced. One read before the
+// lock may be another finalize's, recorded since: two finalizes at once
+// each removed the key they had read, and the first one's copy was left
+// with nothing pointing at it.
+func (s *Store) ReplaceArtifactFile(ctx context.Context, id, fileKey string, size int64, sha256, contentType string) (replaced string, err error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback() //nolint:errcheck
 
@@ -745,12 +756,20 @@ func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size
 		FOR UPDATE OF r
 	`, id).Scan(ctx, &status, &releaseID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrArtifactNotFound
+			return "", ErrArtifactNotFound
 		}
-		return err
+		return "", err
 	}
 	if status != model.ReleaseStatusDraft {
-		return ErrReleaseNotPublishable
+		return "", ErrReleaseNotPublishable
+	}
+	// Under the release lock, which every artifact writer takes first:
+	// what is read now is what this write replaces.
+	if err := tx.NewRaw(`SELECT file_key FROM release_artifacts WHERE id = ?`, id).Scan(ctx, &replaced); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrArtifactNotFound
+		}
+		return "", err
 	}
 
 	// The artifact was read before the release lock was held: deleted
@@ -762,11 +781,11 @@ func (s *Store) UpdateArtifactFile(ctx context.Context, id, fileKey string, size
 		WHERE id = ?
 	`, fileKey, size, sha256, contentType, id).Exec(ctx)); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrArtifactNotFound
+			return "", ErrArtifactNotFound
 		}
-		return err
+		return "", err
 	}
-	return tx.Commit()
+	return replaced, tx.Commit()
 }
 
 // UpdateArtifactSignature stores the Ed25519 signature for an artifact.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/service"
 	"github.com/tabloy/keygate/internal/store"
+	"github.com/tabloy/keygate/pkg/apperr"
 )
 
 // apiFixture is a store with two products, each with a plan and a
@@ -567,6 +569,64 @@ func TestReinstateSaysWhenTheLicenceLapsedMeanwhile(t *testing.T) {
 	}
 	if d := reinstate(f.licB, "now() + interval '30 days'"); d["usable"] != true || d["notice"] != nil {
 		t.Errorf("reinstating a licence within its term = %v, want usable true", d)
+	}
+}
+
+// A licence on a Stripe subscription is reinstated only once Stripe has
+// been read, and answers as the subscription leaves it: a Stripe that
+// cannot answer leaves it suspended, and one Stripe paused meanwhile
+// says so.
+func TestReinstateOfAStripeLicenceFollowsStripe(t *testing.T) {
+	f := newAPIFixture(t)
+	if _, err := f.s.DB.NewRaw("UPDATE licenses SET status = 'suspended', suspended_by = 'admin', suspended_at = now(), stripe_subscription_id = 'sub_follow_' || id WHERE id = ?", f.licA.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	h := &AdminHandler{Store: f.s}
+	reinstate := func() (int, map[string]any) {
+		t.Helper()
+		return f.call(h.ReinstateLicense, http.MethodPost, "/", "", nil, gin.Param{Key: "id", Value: f.licA.ID})
+	}
+	status := func() string {
+		t.Helper()
+		var st string
+		if err := f.s.DB.NewRaw("SELECT status FROM licenses WHERE id = ?", f.licA.ID).Scan(f.ctx, &st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	// One that does not exist is a 404, not taken for a failed read.
+	if code, out := f.call(h.ReinstateLicense, http.MethodPost, "/", "", nil, gin.Param{Key: "id", Value: "no-such-license"}); code != http.StatusNotFound {
+		t.Fatalf("reinstate of a licence that does not exist = %d %v, want 404", code, out)
+	}
+
+	h.FollowSubscription = func(context.Context, *model.License) (func(context.Context) error, error) {
+		return nil, errors.New("stripe unreachable")
+	}
+	if code, out := reinstate(); code != http.StatusBadGateway || errCode(out) != "STRIPE_UNAVAILABLE" || status() != model.StatusSuspended {
+		t.Fatalf("Stripe unreachable: %d %v, licence %s; want 502 STRIPE_UNAVAILABLE and still suspended", code, out, status())
+	}
+	h.FollowSubscription = func(context.Context, *model.License) (func(context.Context) error, error) {
+		return nil, apperr.New(http.StatusConflict, "STRIPE_NOT_VISIBLE", "not visible")
+	}
+	if code, out := reinstate(); code != http.StatusConflict || errCode(out) != "STRIPE_NOT_VISIBLE" || status() != model.StatusSuspended {
+		t.Fatalf("subscription not visible: %d %v, licence %s; want 409 STRIPE_NOT_VISIBLE and still suspended", code, out, status())
+	}
+
+	// Paused in Stripe meanwhile: what the follow writes is the answer.
+	h.FollowSubscription = func(_ context.Context, lic *model.License) (func(context.Context) error, error) {
+		return func(ctx context.Context) error {
+			_, err := f.s.DB.NewRaw("UPDATE licenses SET status = 'suspended', suspended_by = 'stripe', suspended_at = now() WHERE id = ?", lic.ID).Exec(ctx)
+			return err
+		}, nil
+	}
+	code, out := reinstate()
+	if code != http.StatusOK {
+		t.Fatalf("reinstate = %d %v", code, out)
+	}
+	d := out["data"].(map[string]any)
+	if d["status"] != model.StatusSuspended || d["usable"] != false || !strings.Contains(fmt.Sprint(d["notice"]), "paused") {
+		t.Fatalf("paused in Stripe meanwhile: %v, want suspended, not usable, and a notice saying it is paused", d)
 	}
 }
 

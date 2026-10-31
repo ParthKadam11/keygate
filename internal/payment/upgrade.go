@@ -260,7 +260,7 @@ func (h *StripeHandler) StartUpgrade(c *gin.Context) {
 
 		upgradeID := store.NewLicenseUpgradeID()
 		tags := map[string]string{metaKind: kindUpgrade, metaUpgradeID: upgradeID, metaLicenseID: lic.ID}
-		item, err := checkoutLineItem(plan, plan.StripePriceID, mode == stripe.CheckoutSessionModeSubscription, seats)
+		item, err := checkoutLineItem(plan, plan.StripePriceID, mode == stripe.CheckoutSessionModeSubscription, priceMetered(sp), seats)
 		if err != nil {
 			return err
 		}
