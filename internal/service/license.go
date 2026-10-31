@@ -117,33 +117,31 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		return nil, err
 	}
 
-	// A device already activated with this key, or asked about with the
-	// licence's key, which manages every device, needs nothing more. A
-	// member's key on anyone else's device is decided under the lock
-	// below: refused, unless the device predates members' keys and so
-	// moves to them (see Store.ActivateForKey).
+	// Always through ActivateForKey so a concurrent release waits on the
+	// activation row lock. An unlocked FindActivation + signToken used
+	// to hand the released device a fresh offline token while another
+	// machine took the freed slot.
 	seatID := keySeatID(lic)
-	if existing, err := s.store.FindActivation(ctx, lic.ID, in.Identifier); err == nil && (seatID == "" || existing.SeatID == seatID) {
-		_ = s.store.TouchActivation(ctx, existing.ID)
-		middleware.LicenseActivations.WithLabelValues(lic.ProductID, "already_activated").Inc()
-		token, _, err := s.signToken(ctx, lic, in.Identifier)
-		if err != nil {
-			return nil, apperr.Internal(err)
-		}
-		return &ActivateResult{
-			Status: "already_activated", LicenseID: lic.ID,
-			Token: token,
-			Meta:  responseMeta(),
-		}, nil
-	}
-
 	max := s.maxActivations(lic)
 	act := &model.Activation{
 		LicenseID: lic.ID, Identifier: in.Identifier,
 		IdentifierType: in.IdentifierType, Label: in.Label,
 		IPAddress: in.IPAddress, SeatID: seatID,
 	}
-	if err := s.store.ActivateForKey(ctx, act, max, in.LicenseKey); err != nil {
+	err = s.store.ActivateForKey(ctx, act, max, in.LicenseKey)
+	if errors.Is(err, store.ErrAlreadyActivated) {
+		res, gone, aerr := s.finishAlreadyActivated(ctx, lic, in, act, seatID, err)
+		if aerr != nil {
+			return nil, aerr
+		}
+		if !gone {
+			return res, nil
+		}
+		// Released after the lock: compete for a free slot once.
+		act.ID = ""
+		err = s.store.ActivateForKey(ctx, act, max, in.LicenseKey)
+	}
+	if err != nil {
 		// The key was cleared after it was looked up: the member was
 		// removed, or the licence's key changed. Answered as a key
 		// that does not exist, which it now is.
@@ -154,29 +152,20 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 			return nil, apperr.Conflict("DEVICE_HELD",
 				"this device is activated with another key on this license; the license owner can remove it in the portal")
 		}
-		// The machine already held a slot. The read above missed it
-		// because it ran outside the transaction, so this is the same
-		// answer that read would have given: a repeat activation is
-		// the licence working, not a failure.
 		if errors.Is(err, store.ErrAlreadyActivated) {
-			_ = s.store.TouchActivation(ctx, act.ID)
-			if errors.Is(err, store.ErrDeviceMoved) {
-				s.store.Audit(ctx, &model.AuditLog{
-					Entity: "license", EntityID: lic.ID, Action: "device_moved_to_member",
-					ActorType: "sdk", IPAddress: in.IPAddress,
-					Changes: map[string]any{"identifier": in.Identifier, "seat_id": seatID},
-				})
+			res, gone, aerr := s.finishAlreadyActivated(ctx, lic, in, act, seatID, err)
+			if aerr != nil {
+				return nil, aerr
 			}
-			middleware.LicenseActivations.WithLabelValues(lic.ProductID, "already_activated").Inc()
-			token, _, terr := s.signToken(ctx, lic, in.Identifier)
-			if terr != nil {
-				return nil, apperr.Internal(terr)
+			if gone {
+				middleware.LicenseActivations.WithLabelValues(lic.ProductID, "failed").Inc()
+				count, _ := s.store.CountActivations(ctx, lic.ID)
+				return nil, apperr.WithDetails(
+					apperr.Conflict("ACTIVATION_LIMIT", "maximum activations reached"),
+					map[string]any{"max": max, "current": count},
+				)
 			}
-			return &ActivateResult{
-				Status: "already_activated", LicenseID: lic.ID,
-				Token: token,
-				Meta:  responseMeta(),
-			}, nil
+			return res, nil
 		}
 		if err.Error() == "activation limit reached" {
 			middleware.LicenseActivations.WithLabelValues(lic.ProductID, "failed").Inc()
@@ -220,6 +209,36 @@ func (s *LicenseService) Activate(ctx context.Context, in ActivateInput) (*Activ
 		Token: token,
 		Meta:  responseMeta(),
 	}, nil
+}
+
+// finishAlreadyActivated signs for a device ActivateForKey already
+// held under the lock. gone is true when a concurrent release removed
+// the row before the touch — the caller must not sign in that case.
+func (s *LicenseService) finishAlreadyActivated(ctx context.Context, lic *model.License, in ActivateInput, act *model.Activation, seatID string, activateErr error) (*ActivateResult, bool, error) {
+	touched, err := s.store.TouchActivation(ctx, act.ID)
+	if err != nil {
+		return nil, false, apperr.Internal(err)
+	}
+	if !touched {
+		return nil, true, nil
+	}
+	if errors.Is(activateErr, store.ErrDeviceMoved) {
+		s.store.Audit(ctx, &model.AuditLog{
+			Entity: "license", EntityID: lic.ID, Action: "device_moved_to_member",
+			ActorType: "sdk", IPAddress: in.IPAddress,
+			Changes: map[string]any{"identifier": in.Identifier, "seat_id": seatID},
+		})
+	}
+	middleware.LicenseActivations.WithLabelValues(lic.ProductID, "already_activated").Inc()
+	token, _, err := s.signToken(ctx, lic, in.Identifier)
+	if err != nil {
+		return nil, false, apperr.Internal(err)
+	}
+	return &ActivateResult{
+		Status: "already_activated", LicenseID: lic.ID,
+		Token: token,
+		Meta:  responseMeta(),
+	}, false, nil
 }
 
 // recordFailure files a failed attempt and reports the lockout when
@@ -345,7 +364,9 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		// oracle: 403 NOT_ACTIVATED tells the attacker a key is real.
 		return nil, licenseNotFound()
 	}
-	_ = s.store.TouchActivation(ctx, act.ID)
+	if _, err := s.store.TouchActivation(ctx, act.ID); err != nil {
+		return nil, apperr.Internal(err)
+	}
 
 	if s.failures != nil {
 		s.failures.RecordSuccess(middleware.FailureKeyIP(in.IPAddress))

@@ -1600,10 +1600,18 @@ func (s *Store) FindActivation(ctx context.Context, licenseID, identifier string
 		Where("license_id = ? AND identifier = ?", licenseID, identifier).Scan(ctx)
 }
 
-func (s *Store) TouchActivation(ctx context.Context, id string) error {
-	_, err := s.DB.NewUpdate().Model((*model.Activation)(nil)).
+// TouchActivation bumps last_verified. ok is false when the row is
+// already gone (a concurrent release), so a caller that just saw the
+// device under ActivateForKey's lock does not sign a token for a slot
+// that no longer exists.
+func (s *Store) TouchActivation(ctx context.Context, id string) (ok bool, err error) {
+	res, err := s.DB.NewUpdate().Model((*model.Activation)(nil)).
 		Set("last_verified = now()").Where("id = ?", id).Exec(ctx)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // DeleteActivation removes one activation: sql.ErrNoRows when it is
