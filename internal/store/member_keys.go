@@ -256,14 +256,14 @@ func (s *Store) MarkPausedSeats(ctx context.Context, licenseID string, seats []*
 // keyHeldIn reports whether key still opens the licence the way the
 // caller found it: as the member's key when seatID is set (while the
 // product has seats, as FindLicenseByKey holds it), else as the
-// licence's own. Nor once the licence is revoked or suspended: the
-// caller read it usable before taking the licence lock, and a revoke or
-// suspend that committed in between must not be followed by a new
-// device or session on it.
+// licence's own. Nor once the licence is stopped (see stoppedStatuses):
+// the caller read it usable before taking the licence lock, and a revoke,
+// suspend or expiry that committed in between must not be followed by a
+// new device or session on it.
 func keyHeldIn(ctx context.Context, tx bun.Tx, licenseID, seatID, key string) (bool, error) {
 	var held bool
 	var err error
-	stopped := bun.In([]string{model.StatusRevoked, model.StatusSuspended})
+	stopped := bun.In(stoppedStatuses)
 	if seatID != "" {
 		// Not while the member is paused (over the seat limit): read
 		// under the licence lock, so a seat change cannot slip between.

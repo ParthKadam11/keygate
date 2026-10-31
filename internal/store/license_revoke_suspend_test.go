@@ -223,3 +223,47 @@ func TestActivateAndCheckOut_RefusedOnceRevokedOrSuspended(t *testing.T) {
 		t.Errorf("reinstated license has %d activations, want 2", n)
 	}
 }
+
+// So is one that read the licence usable just before it expired: a device
+// or session added in between would stay on a licence that no longer works.
+func TestActivateAndCheckOut_RefusedOnceExpired(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+
+	lic := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	if _, err := s.DB.NewRaw("UPDATE plans SET max_activations = 5 WHERE id = ?", lic.PlanID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ActivateForKey(ctx, &model.Activation{LicenseID: lic.ID, Identifier: "before", IdentifierType: "device"}, 5, lic.LicenseKey); err != nil {
+		t.Fatalf("activate while active: %v", err)
+	}
+	if _, err := s.DB.NewRaw("UPDATE licenses SET status = ? WHERE id = ?", model.StatusExpired, lic.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.ActivateForKey(ctx, &model.Activation{LicenseID: lic.ID, Identifier: "after", IdentifierType: "device"}, 5, lic.LicenseKey)
+	if !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("activate after expiry: err = %v, want ErrKeyRevoked", err)
+	}
+	_, err = s.CheckOutFloatingForKey(ctx, &model.FloatingSession{LicenseID: lic.ID, Identifier: "after",
+		ExpiresAt: time.Now().Add(time.Hour)}, 5, lic.LicenseKey)
+	if !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("checkout after expiry: err = %v, want ErrKeyRevoked", err)
+	}
+	if n, _ := s.CountActivations(ctx, lic.ID); n != 1 {
+		t.Errorf("expired license has %d activations, want the 1 from before", n)
+	}
+
+	// A member's own key is refused the same way.
+	_, _, team := perSeatLicense(t, s, ctx, 5, false)
+	seat := acceptedMember(t, s, ctx, team, "member")
+	key := memberKey(t, s, ctx, seat)
+	if _, err := s.DB.NewRaw("UPDATE licenses SET status = ? WHERE id = ?", model.StatusExpired, team.ID).Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	err = s.ActivateForKey(ctx, &model.Activation{LicenseID: team.ID, SeatID: seat.ID, Identifier: "member-after", IdentifierType: "device"}, 5, key)
+	if !errors.Is(err, store.ErrKeyRevoked) {
+		t.Errorf("member activate after expiry: err = %v, want ErrKeyRevoked", err)
+	}
+}
